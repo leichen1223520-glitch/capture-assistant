@@ -1,0 +1,10 @@
+# 运行基线：Python 3.11
+PySide6
+mss
+rapidocr-onnxruntime
+fastapi
+uvicorn
+websockets
+pydantic>=2,<3
+Pillow
+numpy
