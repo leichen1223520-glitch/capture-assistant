@@ -20,7 +20,7 @@ def main() -> None:
     LOGGER.info("数据目录已就绪：%s", data_dir)
     LOGGER.info("截图目录已就绪：%s", screenshot_dir)
     LOGGER.info("数据库路径：%s", DB_PATH)
-    LOGGER.info("T0 初始化完成；T1/T2 截图与框选模块已就绪，主流程将在 T6/T7 串联。")
+    LOGGER.info("T0–T4 基础模块已就绪；浏览器上下文与用户操作主流程将在 T5–T7 串联。")
 
 
 if __name__ == "__main__":
