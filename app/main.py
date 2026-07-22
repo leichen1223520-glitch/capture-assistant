@@ -1,6 +1,6 @@
 """桌面端入口。
 
-T0 只负责准备本地目录。全局快捷键、托盘和任务编排将在后续阶段实现。
+当前只负责准备本地目录。全局快捷键、托盘和可见操作编排将在 T7 实现。
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ def main() -> None:
     LOGGER.info("数据目录已就绪：%s", data_dir)
     LOGGER.info("截图目录已就绪：%s", screenshot_dir)
     LOGGER.info("数据库路径：%s", DB_PATH)
-    LOGGER.info("T0–T4 基础模块已就绪；浏览器上下文与用户操作主流程将在 T5–T7 串联。")
+    LOGGER.info("T0–T6 基础模块已就绪；用户可见的快捷键与确认流程将在 T7 串联。")
 
 
 if __name__ == "__main__":
