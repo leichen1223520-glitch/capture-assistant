@@ -50,6 +50,19 @@ class CaptureMeta:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ForegroundWindowSnapshot:
+    """某一时刻的前台窗口身份与几何信息。
+
+    快照只包含窗口句柄、进程文件名和屏幕矩形，不读取窗口标题或窗口正文。
+    受保护进程、窗口销毁等竞态会让可选字段诚实地保留为 ``None``。
+    """
+
+    handle: int
+    app_name: str | None
+    bounds: tuple[int, int, int, int] | None
+
+
 class _Point(ctypes.Structure):
     """Windows ``POINT`` 的本地声明，避免在非 Windows 导入时调用 API。"""
 
@@ -205,64 +218,139 @@ def _monitor_device_name(x: int, y: int) -> str | None:
         return None
 
 
-def _foreground_app_name() -> str | None:
-    """尽力返回前台窗口进程名；受保护进程等场景返回 ``None``。"""
+def _process_name_for_window(
+    window: int,
+    user32: object,
+    kernel32: object,
+) -> str | None:
+    """尽力读取指定 HWND 所属的进程文件名。"""
+
+    process_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowThreadProcessId(window, ctypes.byref(process_id))
+    if process_id.value == 0:
+        return None
+
+    process_query_limited_information = 0x1000
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    process = kernel32.OpenProcess(
+        process_query_limited_information,
+        False,
+        process_id.value,
+    )
+    if not process:
+        return None
+
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(buffer))
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        if not kernel32.QueryFullProcessImageNameW(
+            process,
+            0,
+            buffer,
+            ctypes.byref(length),
+        ):
+            return None
+        return os.path.basename(buffer.value) or None
+    finally:
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(process)
+
+
+def _bounds_for_window(
+    window: int,
+    user32: object,
+) -> tuple[int, int, int, int] | None:
+    """尽力读取指定 HWND 在虚拟桌面中的矩形。"""
+
+    bounds = wintypes.RECT()
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    if not user32.GetWindowRect(window, ctypes.byref(bounds)):
+        return None
+    return (
+        int(bounds.left),
+        int(bounds.top),
+        int(bounds.right),
+        int(bounds.bottom),
+    )
+
+
+def foreground_window_snapshot() -> ForegroundWindowSnapshot | None:
+    """一次读取前台 HWND，并尽力补充进程名和窗口矩形。
+
+    无 Windows 桌面或无法取得前台 HWND 时返回 ``None``；取得句柄后，进程
+    查询与矩形查询彼此独立降级，避免一个受限字段丢掉另一个可用字段。
+    """
+
+    if sys.platform != "win32":
+        return None
 
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
         user32.GetForegroundWindow.argtypes = []
         user32.GetForegroundWindow.restype = wintypes.HWND
         window = user32.GetForegroundWindow()
-        if not window:
-            return None
-
-        process_id = wintypes.DWORD()
-        user32.GetWindowThreadProcessId.argtypes = [
-            wintypes.HWND,
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-        user32.GetWindowThreadProcessId(window, ctypes.byref(process_id))
-        if process_id.value == 0:
-            return None
-
-        process_query_limited_information = 0x1000
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        process = kernel32.OpenProcess(
-            process_query_limited_information,
-            False,
-            process_id.value,
-        )
-        if not process:
-            return None
-
-        try:
-            buffer = ctypes.create_unicode_buffer(32768)
-            length = wintypes.DWORD(len(buffer))
-            kernel32.QueryFullProcessImageNameW.argtypes = [
-                wintypes.HANDLE,
-                wintypes.DWORD,
-                wintypes.LPWSTR,
-                ctypes.POINTER(wintypes.DWORD),
-            ]
-            kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-            if not kernel32.QueryFullProcessImageNameW(
-                process,
-                0,
-                buffer,
-                ctypes.byref(length),
-            ):
-                return None
-            return os.path.basename(buffer.value) or None
-        finally:
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle.restype = wintypes.BOOL
-            kernel32.CloseHandle(process)
     except (AttributeError, OSError):
         return None
+    if not window:
+        return None
+
+    handle = int(window)
+    try:
+        bounds = _bounds_for_window(handle, user32)
+    except (AttributeError, OSError):
+        bounds = None
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        app_name = _process_name_for_window(handle, user32, kernel32)
+    except (AttributeError, OSError):
+        app_name = None
+
+    return ForegroundWindowSnapshot(
+        handle=handle,
+        app_name=app_name,
+        bounds=bounds,
+    )
+
+
+def foreground_window_intersects_capture(
+    snapshot: ForegroundWindowSnapshot | None,
+    capture_meta: CaptureMeta,
+) -> bool:
+    """纯逻辑判断前台窗口矩形是否与捕获显示器有正面积交集。"""
+
+    if snapshot is None or snapshot.bounds is None:
+        return False
+
+    window_left, window_top, window_right, window_bottom = snapshot.bounds
+    capture_right = capture_meta.left + capture_meta.width
+    capture_bottom = capture_meta.top + capture_meta.height
+    return (
+        max(window_left, capture_meta.left) < min(window_right, capture_right)
+        and max(window_top, capture_meta.top) < min(window_bottom, capture_bottom)
+    )
+
+
+def foreground_app_name() -> str | None:
+    """兼容入口：复用同一次前台窗口快照并返回进程名。"""
+
+    snapshot = foreground_window_snapshot()
+    return snapshot.app_name if snapshot is not None else None
 
 
 def grab_active_monitor() -> tuple[Image.Image, CaptureMeta]:
@@ -300,7 +388,7 @@ def grab_active_monitor() -> tuple[Image.Image, CaptureMeta]:
         height=height,
         scale=_monitor_scale(cursor_x, cursor_y),
         device_name=_monitor_device_name(cursor_x, cursor_y),
-        app_name=_foreground_app_name(),
+        app_name=foreground_app_name(),
         captured_at=datetime.now().astimezone().isoformat(),
     )
     return image, meta

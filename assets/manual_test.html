@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>采集助手本机验收页</title>
+  <style>
+    body { max-width: 920px; margin: 36px auto; padding: 0 24px; font: 18px/1.65 system-ui, sans-serif; color: #1f2937; }
+    section { margin: 24px 0; padding: 22px; border: 1px solid #d1d5db; border-radius: 12px; }
+    video { width: min(100%, 640px); background: #111827; }
+    label { display: block; margin: 12px 0; }
+    input { display: block; width: min(100%, 420px); padding: 8px; font: inherit; }
+    iframe { width: min(100%, 480px); height: 105px; border: 1px dashed #9ca3af; }
+    .notice { color: #9a3412; }
+  </style>
+</head>
+<body>
+  <h1>采集助手本机验收页</h1>
+  <p>此页面不连接互联网，也不会提交表单。它只用于验证 DOM 原文、视频时间码和敏感输入暂停。</p>
+
+  <section>
+    <h2>一、普通文字</h2>
+    <p id="selectable">真正有价值的采集，不是保存得更多，而是让证据、来源与自己的态度始终可以区分。</p>
+    <p>先选中上面一句，再按 Ctrl+Shift+S 框选；审核窗中的文字来源应优先使用网页原文。</p>
+  </section>
+
+  <section>
+    <h2>二、本机生成的视频</h2>
+    <p id="videoStatus">正在生成约 8 秒的本机测试视频，请稍候……</p>
+    <video controls loop muted></video>
+    <canvas width="640" height="360" hidden></canvas>
+    <p>视频开始循环播放后，在任意明显时间点捕获；审核窗应显示接近当时的秒数。</p>
+  </section>
+
+  <section>
+    <h2>三、敏感输入暂停</h2>
+    <p class="notice">只测试焦点，不要输入任何真实密码、验证码或银行卡信息。</p>
+    <label>测试密码<input type="password" autocomplete="current-password" placeholder="保持空白，只点击聚焦"></label>
+    <label>测试验证码<input inputmode="numeric" autocomplete="one-time-code" placeholder="保持空白，只点击聚焦"></label>
+    <label>测试银行卡<input inputmode="numeric" autocomplete="cc-number" placeholder="保持空白，只点击聚焦"></label>
+    <iframe title="同源 iframe 敏感输入测试" srcdoc='<!doctype html><meta charset="utf-8"><style>body{font:16px system-ui;margin:10px}input{display:block;width:390px;padding:8px}</style><label>同源 iframe 测试密码<input type="password" autocomplete="current-password" placeholder="保持空白，只点击聚焦"></label>'></iframe>
+    <p>任意输入框获得焦点时按 Ctrl+Shift+S，主程序应提示已暂停捕获，不出现冻结画面。</p>
+  </section>
+
+  <script>
+    (() => {
+      const canvas = document.querySelector("canvas");
+      const context = canvas.getContext("2d");
+      const video = document.querySelector("video");
+      const status = document.querySelector("#videoStatus");
+      if (!canvas.captureStream || !window.MediaRecorder) {
+        status.textContent = "当前 Chrome 不支持本机视频生成，请改用普通 HTML5 视频页面验收时间码。";
+        return;
+      }
+
+      const stream = canvas.captureStream(12);
+      let recorder;
+      try {
+        recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8" });
+      } catch (_error) {
+        recorder = new MediaRecorder(stream);
+      }
+      const chunks = [];
+      const startedAt = performance.now();
+      let animationId = 0;
+
+      const draw = (now) => {
+        const seconds = (now - startedAt) / 1000;
+        context.fillStyle = "#111827";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.fillStyle = "#f9fafb";
+        context.font = "bold 42px system-ui";
+        context.fillText("本机视频时间码测试", 105, 145);
+        context.fillStyle = "#60a5fa";
+        context.font = "bold 64px ui-monospace, monospace";
+        context.fillText(`${seconds.toFixed(1)} 秒`, 205, 245);
+        animationId = requestAnimationFrame(draw);
+      };
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size) chunks.push(event.data);
+      };
+      recorder.onstop = async () => {
+        cancelAnimationFrame(animationId);
+        stream.getTracks().forEach((track) => track.stop());
+        video.src = URL.createObjectURL(new Blob(chunks, { type: recorder.mimeType || "video/webm" }));
+        status.textContent = "本机测试视频已生成并开始循环播放。";
+        try { await video.play(); } catch (_error) { status.textContent += " 请手动点击播放。"; }
+      };
+
+      recorder.start();
+      animationId = requestAnimationFrame(draw);
+      setTimeout(() => recorder.stop(), 8000);
+    })();
+  </script>
+</body>
+</html>

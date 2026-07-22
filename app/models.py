@@ -40,9 +40,10 @@ class Card(BaseModel):
     )
 
     id: str = Field(default_factory=_new_card_id)
-    text: str
-    text_source: TextSource
-    confidence: float = Field(ge=0.0, le=1.0)
+    text: str = Field(frozen=True)
+    edited_text: str | None = None
+    text_source: TextSource = Field(frozen=True)
+    confidence: float = Field(ge=0.0, le=1.0, frozen=True)
     screenshot_path: str
     full_screenshot_path: str
     source_url: str | None = None

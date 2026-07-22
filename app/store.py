@@ -19,11 +19,10 @@ from .config import DATA_DIR, DB_PATH
 from .models import Card
 
 FTS_TOKENIZERS: Final = ("trigram", "unicode61")
+RECORD_STATES: Final = ("draft", "saved")
 UPDATABLE_FIELDS: Final = frozenset(
     {
-        "text",
-        "text_source",
-        "confidence",
+        "edited_text",
         "source_url",
         "source_title",
         "video_time",
@@ -49,6 +48,7 @@ class Store:
     ) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
         self.data_dir = Path(data_dir).expanduser().resolve()
+        self.screenshot_dir = self.data_dir / "screenshots"
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5.0)
@@ -71,6 +71,7 @@ class Store:
                     CREATE TABLE IF NOT EXISTS cards (
                         id TEXT PRIMARY KEY NOT NULL,
                         text TEXT NOT NULL,
+                        edited_text TEXT,
                         text_source TEXT NOT NULL CHECK (text_source IN ('dom', 'ocr')),
                         confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
                         screenshot_path TEXT NOT NULL,
@@ -84,7 +85,10 @@ class Store:
                         stance TEXT NOT NULL CHECK (
                             stance IN ('unknown', 'agree', 'disagree', 'doubt', 'useful')
                         ),
-                        note TEXT NOT NULL DEFAULT ''
+                        note TEXT NOT NULL DEFAULT '',
+                        record_state TEXT NOT NULL DEFAULT 'saved' CHECK (
+                            record_state IN ('draft', 'saved')
+                        )
                     );
 
                     CREATE TABLE IF NOT EXISTS app_meta (
@@ -93,33 +97,60 @@ class Store:
                     );
                     """
                 )
+                self._ensure_edited_text_column(connection)
+                self._ensure_record_state_column(connection)
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS cards_state_created_idx
+                    ON cards(record_state, created_at)
+                    """
+                )
+                connection.executescript(
+                    """
+                    DROP TRIGGER IF EXISTS cards_ai;
+                    DROP TRIGGER IF EXISTS cards_ad;
+                    DROP TRIGGER IF EXISTS cards_au;
+                    """
+                )
                 tokenizer = self._ensure_fts_table(connection)
                 connection.executescript(
                     """
-                    CREATE TRIGGER IF NOT EXISTS cards_ai AFTER INSERT ON cards BEGIN
-                        INSERT INTO cards_fts(card_id, text, source_title, note)
+                    DROP TRIGGER IF EXISTS cards_ai;
+                    DROP TRIGGER IF EXISTS cards_ad;
+                    DROP TRIGGER IF EXISTS cards_au;
+
+                    CREATE TRIGGER cards_ai AFTER INSERT ON cards
+                    WHEN new.record_state = 'saved' BEGIN
+                        INSERT INTO cards_fts(
+                            card_id, text, edited_text, source_title, note
+                        )
                         VALUES (
                             new.id,
                             new.text,
+                            COALESCE(new.edited_text, ''),
                             COALESCE(new.source_title, ''),
                             new.note
                         );
                     END;
 
-                    CREATE TRIGGER IF NOT EXISTS cards_ad AFTER DELETE ON cards BEGIN
+                    CREATE TRIGGER cards_ad AFTER DELETE ON cards BEGIN
                         DELETE FROM cards_fts WHERE card_id = old.id;
                     END;
 
-                    CREATE TRIGGER IF NOT EXISTS cards_au
-                    AFTER UPDATE OF text, source_title, note ON cards BEGIN
+                    CREATE TRIGGER cards_au
+                    AFTER UPDATE OF text, edited_text, source_title, note, record_state
+                    ON cards BEGIN
                         DELETE FROM cards_fts WHERE card_id = old.id;
-                        INSERT INTO cards_fts(card_id, text, source_title, note)
-                        VALUES (
+                        INSERT INTO cards_fts(
+                            card_id, text, edited_text, source_title, note
+                        )
+                        SELECT
                             new.id,
                             new.text,
+                            COALESCE(new.edited_text, ''),
                             COALESCE(new.source_title, ''),
                             new.note
-                        );
+                        WHERE new.record_state = 'saved';
                     END;
                     """
                 )
@@ -127,8 +158,17 @@ class Store:
                 connection.execute("DELETE FROM cards_fts")
                 connection.execute(
                     """
-                    INSERT INTO cards_fts(card_id, text, source_title, note)
-                    SELECT id, text, COALESCE(source_title, ''), note FROM cards
+                    INSERT INTO cards_fts(
+                        card_id, text, edited_text, source_title, note
+                    )
+                    SELECT
+                        id,
+                        text,
+                        COALESCE(edited_text, ''),
+                        COALESCE(source_title, ''),
+                        note
+                    FROM cards
+                    WHERE record_state = 'saved'
                     """
                 )
                 connection.execute(
@@ -142,40 +182,68 @@ class Store:
             raise StoreError("无法初始化本地 SQLite/FTS5 数据库。") from exc
 
     @staticmethod
+    def _ensure_edited_text_column(connection: sqlite3.Connection) -> None:
+        """为旧库补充可选校对文字；既有正文继续作为未经覆盖的原始证据。"""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(cards)").fetchall()
+        }
+        if "edited_text" not in columns:
+            connection.execute(
+                "ALTER TABLE cards ADD COLUMN edited_text TEXT"
+            )
+
+    @staticmethod
+    def _ensure_record_state_column(connection: sqlite3.Connection) -> None:
+        """把没有草稿状态的旧库无损迁移为“既有记录均已保存”。"""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(cards)").fetchall()
+        }
+        if "record_state" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE cards ADD COLUMN record_state TEXT NOT NULL
+                DEFAULT 'saved' CHECK (record_state IN ('draft', 'saved'))
+                """
+            )
+
+    @staticmethod
     def _ensure_fts_table(connection: sqlite3.Connection) -> str:
         existing = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards_fts'"
         ).fetchone()
+        preferred: tuple[str, ...] = FTS_TOKENIZERS
         if existing is not None:
             schema_sql = str(existing["sql"] or "").casefold()
-            return "trigram" if "trigram" in schema_sql else "unicode61"
+            current = "trigram" if "trigram" in schema_sql else "unicode61"
+            if "edited_text" in schema_sql:
+                return current
+            connection.execute("DROP TABLE cards_fts")
+            preferred = (current,) if current == "unicode61" else FTS_TOKENIZERS
 
-        try:
-            connection.execute(
-                """
-                CREATE VIRTUAL TABLE cards_fts USING fts5(
-                    card_id UNINDEXED,
-                    text,
-                    source_title,
-                    note,
-                    tokenize = 'trigram'
+        last_error: sqlite3.OperationalError | None = None
+        for tokenizer in preferred:
+            try:
+                connection.execute(
+                    f"""
+                    CREATE VIRTUAL TABLE cards_fts USING fts5(
+                        card_id UNINDEXED,
+                        text,
+                        edited_text,
+                        source_title,
+                        note,
+                        tokenize = '{tokenizer}'
+                    )
+                    """
                 )
-                """
-            )
-            return "trigram"
-        except sqlite3.OperationalError:
-            connection.execute(
-                """
-                CREATE VIRTUAL TABLE cards_fts USING fts5(
-                    card_id UNINDEXED,
-                    text,
-                    source_title,
-                    note,
-                    tokenize = 'unicode61'
-                )
-                """
-            )
-            return "unicode61"
+                return tokenizer
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
 
     def fts_tokenizer(self) -> str:
         """返回当前数据库实际使用的 FTS5 分词器。"""
@@ -192,7 +260,7 @@ class Store:
         return str(row["value"])
 
     @staticmethod
-    def _serialize_card(card: Card) -> tuple[Any, ...]:
+    def _serialize_card(card: Card, record_state: str) -> tuple[Any, ...]:
         monitor_json = (
             json.dumps(card.monitor, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
             if card.monitor is not None
@@ -201,6 +269,7 @@ class Store:
         return (
             card.id,
             card.text,
+            card.edited_text,
             card.text_source,
             card.confidence,
             card.screenshot_path,
@@ -213,6 +282,7 @@ class Store:
             card.created_at,
             card.stance,
             card.note,
+            record_state,
         )
 
     @staticmethod
@@ -222,6 +292,7 @@ class Store:
             return Card(
                 id=row["id"],
                 text=row["text"],
+                edited_text=row["edited_text"],
                 text_source=row["text_source"],
                 confidence=row["confidence"],
                 screenshot_path=row["screenshot_path"],
@@ -238,8 +309,9 @@ class Store:
         except (json.JSONDecodeError, TypeError, ValidationError) as exc:
             raise StoreError("数据库中的卡片记录不符合当前数据契约。") from exc
 
-    def add_card(self, card: Card) -> Card:
-        """验证并新增一张卡片；重复 ID 会明确失败。"""
+    def _add_card(self, card: Card, *, record_state: str) -> Card:
+        if record_state not in RECORD_STATES:
+            raise StoreError("卡片内部状态无效。")
 
         try:
             validated = Card.model_validate(card.model_dump())
@@ -250,13 +322,13 @@ class Store:
                 connection.execute(
                     """
                     INSERT INTO cards(
-                        id, text, text_source, confidence,
+                        id, text, edited_text, text_source, confidence,
                         screenshot_path, full_screenshot_path,
                         source_url, source_title, video_time, app_name,
-                        monitor_json, created_at, stance, note
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        monitor_json, created_at, stance, note, record_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    self._serialize_card(validated),
+                    self._serialize_card(validated, record_state),
                 )
         except sqlite3.IntegrityError as exc:
             raise StoreError("卡片 ID 已存在或字段违反数据库约束。") from exc
@@ -264,13 +336,39 @@ class Store:
             raise StoreError("无法保存本地卡片。") from exc
         return validated
 
-    def get_card(self, card_id: str) -> Card | None:
-        """按 ID 返回卡片，不存在时返回 ``None``。"""
+    def add_card(self, card: Card) -> Card:
+        """验证并新增一张正式卡片；保持既有公开行为不变。"""
 
+        return self._add_card(card, record_state="saved")
+
+    def add_draft(self, card: Card) -> Card:
+        """新增一张等待人工审核的草稿，普通读取与检索不会暴露它。"""
+
+        return self._add_card(card, record_state="draft")
+
+    def _get_card_any_state(self, card_id: str) -> tuple[Card, str] | None:
         try:
             with closing(self._connect()) as connection:
                 row = connection.execute(
                     "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreError("无法读取本地卡片。") from exc
+        if row is None:
+            return None
+        state = str(row["record_state"])
+        if state not in RECORD_STATES:
+            raise StoreError("数据库中的卡片内部状态无效。")
+        return self._row_to_card(row), state
+
+    def get_card(self, card_id: str) -> Card | None:
+        """按 ID 返回已审核保存的卡片；草稿与不存在均返回 ``None``。"""
+
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT * FROM cards WHERE id = ? AND record_state = 'saved'",
                     (card_id,),
                 ).fetchone()
         except sqlite3.Error as exc:
@@ -311,15 +409,12 @@ class Store:
                 cursor = connection.execute(
                     """
                     UPDATE cards SET
-                        text = ?, text_source = ?, confidence = ?,
-                        source_url = ?, source_title = ?, video_time = ?,
+                        edited_text = ?, source_url = ?, source_title = ?, video_time = ?,
                         app_name = ?, monitor_json = ?, stance = ?, note = ?
                     WHERE id = ?
                     """,
                     (
-                        validated.text,
-                        validated.text_source,
-                        validated.confidence,
+                        validated.edited_text,
                         validated.source_url,
                         validated.source_title,
                         validated.video_time,
@@ -336,6 +431,64 @@ class Store:
             raise StoreError("无法更新本地卡片。") from exc
         return validated
 
+    def finalize_draft(self, card_id: str, **changes: Any) -> Card:
+        """校验修改并把一张草稿原子转为正式卡片，从此进入 FTS 与普通读取。"""
+
+        unknown_fields = set(changes) - UPDATABLE_FIELDS
+        if unknown_fields:
+            raise StoreError("完成草稿时包含不允许修改的卡片字段。")
+        loaded = self._get_card_any_state(card_id)
+        if loaded is None:
+            raise StoreError("待完成的草稿不存在。")
+        current, record_state = loaded
+        if record_state != "draft":
+            raise StoreError("待完成的记录不是草稿。")
+
+        payload = current.model_dump()
+        payload.update(changes)
+        try:
+            validated = Card.model_validate(payload)
+        except ValidationError as exc:
+            raise StoreError("完成后的卡片不符合数据契约。") from exc
+
+        monitor_json = (
+            json.dumps(
+                validated.monitor,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if validated.monitor is not None
+            else None
+        )
+        try:
+            with closing(self._connect()) as connection, connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE cards SET
+                        edited_text = ?, source_url = ?, source_title = ?, video_time = ?,
+                        app_name = ?, monitor_json = ?, stance = ?, note = ?,
+                        record_state = 'saved'
+                    WHERE id = ? AND record_state = 'draft'
+                    """,
+                    (
+                        validated.edited_text,
+                        validated.source_url,
+                        validated.source_title,
+                        validated.video_time,
+                        validated.app_name,
+                        monitor_json,
+                        validated.stance,
+                        validated.note,
+                        card_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StoreError("草稿在完成写入前已不存在或状态已经改变。")
+        except sqlite3.Error as exc:
+            raise StoreError("无法完成本地草稿。") from exc
+        return validated
+
     def list_recent(self, limit: int = 50, offset: int = 0) -> list[Card]:
         """按创建时间倒序返回最近卡片。"""
 
@@ -345,6 +498,7 @@ class Store:
                 rows = connection.execute(
                     """
                     SELECT * FROM cards
+                    WHERE record_state = 'saved'
                     ORDER BY datetime(created_at) DESC, rowid DESC
                     LIMIT ? OFFSET ?
                     """,
@@ -402,6 +556,7 @@ class Store:
                             FROM cards_fts
                             JOIN cards ON cards.id = cards_fts.card_id
                             WHERE cards_fts MATCH ?
+                              AND cards.record_state = 'saved'
                             ORDER BY bm25(cards_fts), datetime(cards.created_at) DESC
                             LIMIT ?
                             """,
@@ -424,49 +579,178 @@ class Store:
         return connection.execute(
             """
             SELECT * FROM cards
-            WHERE instr(text, ?) > 0
-               OR instr(COALESCE(source_title, ''), ?) > 0
-               OR instr(note, ?) > 0
+            WHERE record_state = 'saved'
+              AND (
+                   instr(text, ?) > 0
+                OR instr(COALESCE(edited_text, ''), ?) > 0
+                OR instr(COALESCE(source_title, ''), ?) > 0
+                OR instr(note, ?) > 0
+              )
             ORDER BY datetime(created_at) DESC, rowid DESC
             LIMIT ?
             """,
-            (query, query, query, limit),
+            (query, query, query, query, limit),
         ).fetchall()
 
     def _safe_screenshot_path(self, relative_path: str) -> Path:
-        candidate = (self.data_dir / relative_path).resolve()
-        if candidate == self.data_dir or self.data_dir not in candidate.parents:
-            raise StoreError("卡片截图路径超出本地数据目录，已拒绝删除。")
+        try:
+            screenshot_root = self.screenshot_dir.resolve()
+            candidate = (self.data_dir / relative_path).resolve()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise StoreError("无法安全解析卡片截图路径，已拒绝删除。") from exc
+        if (
+            screenshot_root == self.data_dir
+            or self.data_dir not in screenshot_root.parents
+        ):
+            raise StoreError("截图目录超出本地数据目录，已拒绝文件操作。")
+        if candidate == screenshot_root or screenshot_root not in candidate.parents:
+            raise StoreError("卡片截图路径超出受控截图目录，已拒绝删除。")
+        if candidate == self.db_path:
+            raise StoreError("卡片截图路径指向本地数据库，已拒绝删除。")
         return candidate
 
-    def delete_card(self, card_id: str) -> bool:
-        """删除卡片、FTS 记录和两张本地截图；不存在时返回 ``False``。
+    def _assert_no_cross_references(
+        self,
+        connection: sqlite3.Connection,
+        card_id: str,
+        paths: set[Path],
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT screenshot_path, full_screenshot_path
+            FROM cards WHERE id <> ?
+            """,
+            (card_id,),
+        ).fetchall()
+        for row in rows:
+            for field in ("screenshot_path", "full_screenshot_path"):
+                try:
+                    referenced = self._safe_screenshot_path(str(row[field]))
+                except StoreError:
+                    # 其他记录的越界路径不是当前受控目标；它会在自身删除时被拒绝。
+                    continue
+                if referenced in paths:
+                    raise StoreError("卡片截图仍被其他记录引用，已拒绝删除。")
+
+    def _delete_card(
+        self,
+        card_id: str,
+        *,
+        required_state: str | None = None,
+    ) -> bool:
+        """在一个写事务内按可选状态删除记录及两张截图。由于先取得
+        ``BEGIN IMMEDIATE``，状态检查与删除之间不会被另一写入者改成正式卡片。
 
         为优先保护隐私，先清理经路径边界验证的截图，再提交数据库删除。若极少见
         的数据库写入失败，可能留下指向已删除截图的卡片，但不会留下未受控副本。
         """
 
-        card = self.get_card(card_id)
-        if card is None:
-            return False
+        if required_state is not None and required_state not in RECORD_STATES:
+            raise StoreError("待删除卡片状态不合法。")
 
-        paths = {
-            self._safe_screenshot_path(card.screenshot_path),
-            self._safe_screenshot_path(card.full_screenshot_path),
-        }
-        for path in paths:
-            try:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if required_state is None:
+                row = connection.execute(
+                    "SELECT * FROM cards WHERE id = ?",
+                    (card_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM cards WHERE id = ? AND record_state = ?",
+                    (card_id, required_state),
+                ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            card = self._row_to_card(row)
+            paths = {
+                self._safe_screenshot_path(card.screenshot_path),
+                self._safe_screenshot_path(card.full_screenshot_path),
+            }
+            self._assert_no_cross_references(connection, card_id, paths)
+            for path in paths:
                 if path.is_dir():
                     raise StoreError("卡片截图路径指向目录，已拒绝删除。")
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                raise StoreError("无法删除本地卡片截图；数据库记录仍被保留。") from exc
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    raise StoreError(
+                        "无法删除本地卡片截图；数据库记录仍被保留。"
+                    ) from exc
+
+            if required_state is None:
+                cursor = connection.execute(
+                    "DELETE FROM cards WHERE id = ?",
+                    (card_id,),
+                )
+            else:
+                cursor = connection.execute(
+                    "DELETE FROM cards WHERE id = ? AND record_state = ?",
+                    (card_id, required_state),
+                )
+            if cursor.rowcount != 1:
+                raise StoreError("待删除卡片在写入前已不存在。")
+            connection.commit()
+            return True
+        except StoreError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as exc:
+            connection.rollback()
+            raise StoreError("截图已清理，但无法删除本地数据库记录。") from exc
+        finally:
+            connection.close()
+
+    def delete_card(self, card_id: str) -> bool:
+        """删除正式卡片或草稿、FTS 记录和两张截图；不存在时返回 ``False``。"""
+
+        return self._delete_card(card_id)
+
+    def delete_draft(self, card_id: str) -> bool:
+        """只删除仍处于草稿状态的记录和截图，绝不删除正式卡片。"""
+
+        return self._delete_card(card_id, required_state="draft")
+
+    def cleanup_drafts(self) -> int:
+        """清理上次异常退出遗留的全部草稿及截图，并返回删除数量。
+
+        主程序应在接受新的抓取请求之前调用。任何一张草稿清理失败都会抛出异常，
+        让启动流程能够明确提示，而不是把遗留候选悄悄当成正式资料。
+        """
 
         try:
-            with closing(self._connect()) as connection, connection:
-                cursor = connection.execute("DELETE FROM cards WHERE id = ?", (card_id,))
-                if cursor.rowcount != 1:
-                    raise StoreError("待删除卡片在写入前已不存在。")
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM cards
+                    WHERE record_state = 'draft' ORDER BY rowid
+                    """
+                ).fetchall()
+                for row in rows:
+                    card = self._row_to_card(row)
+                    card_id = card.id
+                    expected_selected = f"screenshots/{card_id}.png"
+                    expected_full = f"screenshots/full_{card_id}.png"
+                    if (
+                        card.screenshot_path != expected_selected
+                        or card.full_screenshot_path != expected_full
+                    ):
+                        raise StoreError(
+                            "候选草稿截图文件名不符合安全清理规范，已停止启动清理。"
+                        )
+                    paths = {
+                        self._safe_screenshot_path(expected_selected),
+                        self._safe_screenshot_path(expected_full),
+                    }
+                    self._assert_no_cross_references(connection, card_id, paths)
         except sqlite3.Error as exc:
-            raise StoreError("截图已清理，但无法删除本地数据库记录。") from exc
-        return True
+            raise StoreError("无法读取待清理的候选草稿。") from exc
+
+        deleted = 0
+        for row in rows:
+            if self.delete_draft(str(row["id"])):
+                deleted += 1
+        return deleted

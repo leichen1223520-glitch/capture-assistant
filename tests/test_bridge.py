@@ -18,9 +18,9 @@ def _bridge_uri(bridge: BrowserBridge) -> str:
 
 
 async def _hello(websocket: object) -> None:
-    await websocket.send('{"type":"hello","protocol":1}')
+    await websocket.send('{"type":"hello","protocol":2}')
     acknowledgement = json.loads(await websocket.recv())
-    assert acknowledgement == {"type": "hello_ack", "protocol": 1}
+    assert acknowledgement == {"type": "hello_ack", "protocol": 2}
 
 
 @pytest.fixture
@@ -48,6 +48,18 @@ def test_no_connection_returns_none_without_waiting_for_timeout(
     assert elapsed < 0.15
 
 
+def test_protocol_v1_hello_is_rejected(bridge: BrowserBridge) -> None:
+    async def scenario() -> int | None:
+        async with connect(_bridge_uri(bridge), proxy=None) as websocket:
+            await websocket.send('{"type":"hello","protocol":1}')
+            with pytest.raises(ConnectionClosed) as caught:
+                await websocket.recv()
+            return caught.value.rcvd.code if caught.value.rcvd is not None else None
+
+    assert asyncio.run(scenario()) == 1008
+    assert bridge.is_running
+
+
 def test_real_websocket_round_trip_returns_validated_context(
     bridge: BrowserBridge,
 ) -> None:
@@ -68,6 +80,7 @@ def test_real_websocket_round_trip_returns_validated_context(
                         "title": "示例视频",
                         "selection": "保留原始观点",
                         "video_time": 12.5,
+                        "sensitive_input": False,
                     },
                     ensure_ascii=False,
                 )
@@ -79,7 +92,89 @@ def test_real_websocket_round_trip_returns_validated_context(
         title="示例视频",
         selection="保留原始观点",
         video_time=12.5,
+        sensitive_input=False,
     )
+
+
+def test_sensitive_context_returns_no_selection(bridge: BrowserBridge) -> None:
+    async def scenario() -> BrowserContext | None:
+        async with connect(_bridge_uri(bridge), proxy=None) as websocket:
+            await _hello(websocket)
+            request_task = asyncio.create_task(
+                asyncio.to_thread(bridge.get_browser_context, 0.5)
+            )
+            request = json.loads(await websocket.recv())
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "context",
+                        "request_id": request["request_id"],
+                        "url": "https://example.test/login",
+                        "title": "登录",
+                        "selection": "",
+                        "video_time": None,
+                        "sensitive_input": True,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return await request_task
+
+    assert asyncio.run(scenario()) == BrowserContext(
+        url="https://example.test/login",
+        title="登录",
+        selection="",
+        video_time=None,
+        sensitive_input=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sensitive_input", "selection"),
+    [
+        ("false", ""),
+        (0, ""),
+        (None, ""),
+        (True, "不得传递的敏感文字"),
+    ],
+)
+def test_invalid_sensitive_context_is_rejected(
+    bridge: BrowserBridge,
+    sensitive_input: object,
+    selection: str,
+) -> None:
+    async def scenario() -> tuple[int | None, BrowserContext | None]:
+        async with connect(_bridge_uri(bridge), proxy=None) as websocket:
+            await _hello(websocket)
+            request_task = asyncio.create_task(
+                asyncio.to_thread(bridge.get_browser_context, 0.5)
+            )
+            request = json.loads(await websocket.recv())
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "context",
+                        "request_id": request["request_id"],
+                        "url": "https://example.test/login",
+                        "title": "登录",
+                        "selection": selection,
+                        "video_time": None,
+                        "sensitive_input": sensitive_input,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            with pytest.raises(ConnectionClosed) as caught:
+                await websocket.recv()
+            close_code = (
+                caught.value.rcvd.code if caught.value.rcvd is not None else None
+            )
+            return close_code, await request_task
+
+    close_code, result = asyncio.run(scenario())
+    assert close_code == 1008
+    assert result is None
+    assert bridge.is_running
 
 
 def test_timeout_and_stale_request_id_do_not_poison_next_request(
@@ -103,6 +198,7 @@ def test_timeout_and_stale_request_id_do_not_poison_next_request(
                         "title": "过期",
                         "selection": "不应返回",
                         "video_time": None,
+                        "sensitive_input": False,
                     },
                     ensure_ascii=False,
                 )
@@ -121,6 +217,7 @@ def test_timeout_and_stale_request_id_do_not_poison_next_request(
                         "title": "新请求",
                         "selection": "有效",
                         "video_time": 0,
+                        "sensitive_input": False,
                     },
                     ensure_ascii=False,
                 )
@@ -215,6 +312,7 @@ def test_web_page_origin_is_rejected_without_replacing_extension(
                         "title": "仍由扩展响应",
                         "selection": "可信连接仍在",
                         "video_time": None,
+                        "sensitive_input": False,
                     },
                     ensure_ascii=False,
                 )
@@ -258,6 +356,7 @@ def test_non_ascii_context_within_utf8_budget_round_trips(
                         "title": "中文",
                         "selection": selection,
                         "video_time": None,
+                        "sensitive_input": False,
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -306,6 +405,7 @@ def test_concurrent_requests_can_resolve_out_of_order(
                             "title": f"请求 {index}",
                             "selection": str(index),
                             "video_time": None,
+                            "sensitive_input": False,
                         },
                         ensure_ascii=False,
                     )

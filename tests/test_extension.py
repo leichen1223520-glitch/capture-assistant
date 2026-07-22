@@ -43,20 +43,36 @@ def test_background_connects_only_to_loopback_and_requires_focused_window() -> N
     assert "lastFocusedWindow: true" not in source
     assert "new TextEncoder()" in source
     assert "KEEPALIVE_INTERVAL_MS = 20_000" in source
+    assert "const PROTOCOL_VERSION = 2" in source
+
+
+def test_background_requires_boolean_sensitive_flag_and_clears_selection() -> None:
+    source = (EXTENSION_DIR / "background.js").read_text(encoding="utf-8")
+
+    assert 'typeof value.sensitive_input !== "boolean"' in source
+    assert 'selection: value.sensitive_input' in source
+    assert 'sensitive_input: value.sensitive_input' in source
 
 
 def test_content_script_never_reads_common_sensitive_input_values() -> None:
     source = (EXTENSION_DIR / "content.js").read_text(encoding="utf-8")
 
     for marker in (
-        'type.toLowerCase() === "password"',
+        'inputType === "password"',
         '"current-password"',
         '"new-password"',
         '"one-time-code"',
         '"cc-number"',
         '"cc-csc"',
+        '"cc-exp"',
+        '"cc-name"',
     ):
         assert marker in source
-    assert source.index("isSensitiveInput(activeElement)") < source.index(
-        "window.getSelection()"
-    )
+    assert "activeState.uninspectableFrame || isSensitiveInput(activeElement)" in source
+    assert 'activeName === "iframe"' in source
+    assert "element.localName" in source
+    assert "instanceof HTMLInputElement" not in source
+    assert "instanceof HTMLTextAreaElement" not in source
+    assert "instanceof HTMLIFrameElement" not in source
+    assert 'selection: sensitiveInput ? "" : selectedText(activeElement)' in source
+    assert "sensitive_input: sensitiveInput" in source

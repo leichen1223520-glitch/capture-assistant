@@ -49,7 +49,10 @@ capture_assistant/
 │  ├─ server.py     # 本机只读检索服务
 │  ├─ models.py     # 观点卡片数据结构
 │  ├─ config.py     # 快捷键、路径和端口
-│  └─ pipeline.py   # T6 起加入的卡片生成流水线
+│  ├─ pipeline.py   # T6 起加入的卡片生成流水线
+│  ├─ hotkey.py     # Windows RegisterHotKey 封装
+│  ├─ review.py     # 候选卡片人工审核窗口
+│  └─ safety.py     # 敏感应用与捕获前安全判断
 ├─ extension/       # Chrome Manifest V3 扩展
 ├─ assets/          # 可提交的测试样例等静态资源
 ├─ docs/            # 中文项目文档
@@ -97,7 +100,8 @@ capture_assistant/
 T0 的 `Card` 是后续模块共同依赖的契约，至少包含：
 
 - `id`：UUID4 字符串。
-- `text`：原文、DOM 选中文字或 OCR 文字。
+- `text`：不可静默覆盖的提取原文，即 DOM 选中文字或 OCR 文字。
+- `edited_text`：用户审核后可选的整理文字，默认 `None`；不得替代或改写 `text` 的证据语义。
 - `text_source`：仅允许 `dom` 或 `ocr`。
 - `confidence`：范围 0–1。
 - `screenshot_path`、`full_screenshot_path`：相对路径。

@@ -19,7 +19,12 @@ from app.capture import CaptureError, CaptureMeta, save_image as real_save_image
 from app.config import DB_PATH
 from app.models import Card
 from app.ocr import OCRError
-from app.pipeline import PipelineError, build_card_from_selection
+from app.pipeline import (
+    PipelineError,
+    PreparedCard,
+    build_card_from_selection,
+    prepare_card_from_selection,
+)
 from app.store import Store, StoreError
 
 
@@ -77,12 +82,18 @@ class PipelineTests(unittest.TestCase):
             **arguments,
         )
 
-    def _context(self, *, selection: str) -> BrowserContext:
+    def _context(
+        self,
+        *,
+        selection: str,
+        sensitive_input: bool = False,
+    ) -> BrowserContext:
         return BrowserContext(
             url="https://example.com/watch?v=local",
             title="本地视频标题",
             selection=selection,
             video_time=42.25,
+            sensitive_input=sensitive_input,
         )
 
     def _assert_no_artifacts(self, store: Store | None = None) -> None:
@@ -124,6 +135,118 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(full.size, self.image.size)
             self.assertEqual(full.convert("RGB").tobytes(), self.image.tobytes())
 
+    def test_prepare_is_memory_only_and_owns_both_evidence_images(self) -> None:
+        memory_only_data = Path(self.temporary.name) / "memory-only-data"
+        source = self.image.copy()
+        expected_full_pixels = source.tobytes()
+
+        prepared = prepare_card_from_selection(
+            source,
+            self.meta,
+            self.rect,
+            context_provider=lambda: self._context(selection="内存审核候选"),
+            ocr_provider=lambda _image: (_ for _ in ()).throw(
+                AssertionError("DOM 分支不应执行 OCR")
+            ),
+            data_dir=memory_only_data,
+            screenshot_dir=memory_only_data / "screenshots",
+        )
+
+        self.assertIsInstance(prepared, PreparedCard)
+        self.assertEqual(prepared.card.text, "内存审核候选")
+        self.assertEqual(prepared.card.text_source, "dom")
+        self.assertEqual(prepared.selected_image.size, (5, 3))
+        self.assertEqual(prepared.selected_image.getpixel((0, 0)), (10, 20, 30))
+        self.assertTrue(prepared.selected_preview_png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(prepared.full_preview_png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertFalse(memory_only_data.exists())
+        self.assertEqual(self.store.list_recent(), [])
+
+        source.putpixel((2, 2), (200, 210, 220))
+        source.close()
+        self.assertEqual(prepared.full_image.tobytes(), expected_full_pixels)
+        self.assertEqual(prepared.full_image.getpixel((2, 2)), (10, 20, 30))
+
+        prepared.close()
+        prepared.close()
+        self.assertTrue(prepared.is_closed)
+        self.assertEqual(prepared.selected_preview_png, b"")
+        self.assertEqual(prepared.full_preview_png, b"")
+        with self.assertRaises(ValueError):
+            prepared.selected_image.getpixel((0, 0))
+        with self.assertRaises(ValueError):
+            prepared.full_image.getpixel((0, 0))
+
+    def test_prepare_rejects_sensitive_context_without_any_persistence(self) -> None:
+        sensitive_data = Path(self.temporary.name) / "sensitive-memory-only"
+
+        with self.assertRaisesRegex(PipelineError, "密码、验证码或支付信息"):
+            prepare_card_from_selection(
+                self.image,
+                self.meta,
+                self.rect,
+                context_provider=lambda: self._context(
+                    selection="不应采用的敏感原文",
+                    sensitive_input=True,
+                ),
+                ocr_provider=lambda _image: (_ for _ in ()).throw(
+                    AssertionError("敏感状态不应执行 OCR")
+                ),
+                data_dir=sensitive_data,
+                screenshot_dir=sensitive_data / "screenshots",
+            )
+
+        self.assertFalse(sensitive_data.exists())
+        self.assertEqual(self.store.list_recent(), [])
+
+    def test_build_always_closes_prepared_images_after_persistence(self) -> None:
+        prepared = prepare_card_from_selection(
+            self.image,
+            self.meta,
+            self.rect,
+            context_provider=lambda: self._context(selection="关闭内存候选"),
+            data_dir=self.data_dir,
+            screenshot_dir=self.screenshot_dir,
+        )
+
+        with patch(
+            "app.pipeline.prepare_card_from_selection",
+            return_value=prepared,
+        ):
+            card = self._build(context_provider=lambda: None)
+
+        self.assertEqual(card, prepared.card)
+        self.assertTrue(prepared.is_closed)
+
+    def test_build_closes_prepared_images_when_database_write_fails(self) -> None:
+        prepared = prepare_card_from_selection(
+            self.image,
+            self.meta,
+            self.rect,
+            context_provider=lambda: self._context(selection="写入失败候选"),
+            data_dir=self.data_dir,
+            screenshot_dir=self.screenshot_dir,
+        )
+        failing_store = _FailingStore(
+            db_path=self.data_dir / "prepared-failure.sqlite3",
+            data_dir=self.data_dir,
+        )
+        failing_store.init_db()
+
+        with patch(
+            "app.pipeline.prepare_card_from_selection",
+            return_value=prepared,
+        ):
+            with self.assertRaises(PipelineError):
+                self._build(
+                    store=failing_store,
+                    context_provider=lambda: None,
+                )
+
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse((self.data_dir / prepared.card.screenshot_path).exists())
+        self.assertFalse((self.data_dir / prepared.card.full_screenshot_path).exists())
+
     def test_blank_dom_selection_uses_only_cropped_image_for_ocr(self) -> None:
         observed_sizes: list[tuple[int, int]] = []
 
@@ -142,6 +265,21 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(card.confidence, 0.73)
         self.assertEqual(card.source_title, "本地视频标题")
         self.assertEqual(card.video_time, 42.25)
+
+    def test_sensitive_browser_context_stops_before_ocr_or_persistence(self) -> None:
+        def forbidden_ocr(_image):  # type: ignore[no-untyped-def]
+            raise AssertionError("敏感输入状态不应执行 OCR")
+
+        with self.assertRaisesRegex(PipelineError, "密码、验证码或支付信息"):
+            self._build(
+                context_provider=lambda: self._context(
+                    selection="",
+                    sensitive_input=True,
+                ),
+                ocr_provider=forbidden_ocr,
+            )
+
+        self._assert_no_artifacts()
 
     def test_public_default_store_is_lazily_initialized(self) -> None:
         default_data = Path(self.temporary.name) / "default-data"
@@ -531,6 +669,18 @@ class PipelineTests(unittest.TestCase):
             )
 
         self.assertFalse(outside.exists())
+        self._assert_no_artifacts()
+
+    def test_direct_save_requires_store_controlled_screenshot_directory(self) -> None:
+        other_inside_data = self.data_dir / "other-screenshots"
+
+        with self.assertRaisesRegex(PipelineError, "受控截图目录一致"):
+            self._build(
+                screenshot_dir=other_inside_data,
+                context_provider=lambda: self._context(selection="DOM 原文"),
+            )
+
+        self.assertFalse(other_inside_data.exists())
         self._assert_no_artifacts()
 
     def test_rejects_store_and_pipeline_data_directory_mismatch(self) -> None:

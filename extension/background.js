@@ -1,7 +1,7 @@
 "use strict";
 
 const BRIDGE_URL = "ws://127.0.0.1:8765";
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const KEEPALIVE_INTERVAL_MS = 20_000;
 const STABLE_CONNECTION_MS = 60_000;
 const MAX_RECONNECT_ATTEMPTS = 8;
@@ -97,6 +97,9 @@ function normalizePageContext(value) {
   if (value === null || typeof value !== "object") {
     return null;
   }
+  if (typeof value.sensitive_input !== "boolean") {
+    return null;
+  }
   const rawVideoTime = value.video_time;
   const videoTime = typeof rawVideoTime === "number"
     && Number.isFinite(rawVideoTime)
@@ -106,8 +109,11 @@ function normalizePageContext(value) {
   return {
     url: boundedString(value.url, 8_192, URL_JSON_BYTES),
     title: boundedString(value.title, 2_048, TITLE_JSON_BYTES),
-    selection: boundedString(value.selection, 32_768, SELECTION_JSON_BYTES),
+    selection: value.sensitive_input
+      ? ""
+      : boundedString(value.selection, 32_768, SELECTION_JSON_BYTES),
     video_time: videoTime,
+    sensitive_input: value.sensitive_input,
   };
 }
 

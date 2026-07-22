@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -64,6 +65,204 @@ class StoreTests(unittest.TestCase):
 
         self.assertIn(self.store.fts_tokenizer(), {"trigram", "unicode61"})
 
+    def test_legacy_database_migrates_existing_cards_as_saved(self) -> None:
+        legacy_db = self.data_dir / "legacy.sqlite3"
+        card = _card("旧库中的正式观点", suffix="legacy", title="旧库标题")
+        with closing(sqlite3.connect(legacy_db)) as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE cards (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    text TEXT NOT NULL,
+                    text_source TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    screenshot_path TEXT NOT NULL,
+                    full_screenshot_path TEXT NOT NULL,
+                    source_url TEXT,
+                    source_title TEXT,
+                    video_time REAL,
+                    app_name TEXT,
+                    monitor_json TEXT,
+                    created_at TEXT NOT NULL,
+                    stance TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT ''
+                );
+                CREATE VIRTUAL TABLE cards_fts USING fts5(
+                    card_id UNINDEXED,
+                    text,
+                    source_title,
+                    note,
+                    tokenize = 'unicode61'
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO cards VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    card.id,
+                    card.text,
+                    card.text_source,
+                    card.confidence,
+                    card.screenshot_path,
+                    card.full_screenshot_path,
+                    card.source_url,
+                    card.source_title,
+                    card.video_time,
+                    card.app_name,
+                    json.dumps(card.monitor),
+                    card.created_at,
+                    card.stance,
+                    card.note,
+                ),
+            )
+
+        migrated = Store(legacy_db, self.data_dir)
+        migrated.init_db()
+
+        self.assertEqual(migrated.get_card(card.id), card)
+        self.assertEqual([item.id for item in migrated.search("正式观点")], [card.id])
+        with closing(sqlite3.connect(legacy_db)) as connection:
+            migrated_columns = connection.execute(
+                "SELECT record_state, edited_text FROM cards WHERE id = ?",
+                (card.id,),
+            ).fetchone()
+            fts_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(cards_fts)").fetchall()
+            }
+        self.assertEqual(migrated_columns, ("saved", None))
+        self.assertIn("edited_text", fts_columns)
+
+    def test_draft_is_hidden_from_get_list_search_and_fts(self) -> None:
+        draft = _card("尚未审核的候选观点", suffix="hidden-draft")
+        self._write_screenshots(draft)
+
+        self.store.add_draft(draft)
+
+        self.assertIsNone(self.store.get_card(draft.id))
+        self.assertEqual(self.store.list_recent(), [])
+        self.assertEqual(self.store.search("候选观点"), [])
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            state = connection.execute(
+                "SELECT record_state FROM cards WHERE id = ?", (draft.id,)
+            ).fetchone()
+            indexed = connection.execute(
+                "SELECT count(*) FROM cards_fts WHERE card_id = ?", (draft.id,)
+            ).fetchone()
+        self.assertEqual(state, ("draft",))
+        self.assertEqual(indexed, (0,))
+
+    def test_finalize_draft_makes_edited_card_visible_and_searchable(self) -> None:
+        draft = _card("审核前的候选文字", suffix="finalize")
+        self.store.add_draft(draft)
+
+        finalized = self.store.finalize_draft(
+            draft.id,
+            edited_text="审核后的正式观点",
+            stance="agree",
+            note="已由用户确认",
+        )
+
+        self.assertEqual(finalized.text, "审核前的候选文字")
+        self.assertEqual(finalized.edited_text, "审核后的正式观点")
+        self.assertEqual(finalized.stance, "agree")
+        self.assertEqual(self.store.get_card(draft.id), finalized)
+        self.assertEqual(self.store.list_recent(), [finalized])
+        self.assertEqual([item.id for item in self.store.search("正式观点")], [draft.id])
+        self.assertEqual([item.id for item in self.store.search("候选文字")], [draft.id])
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            state = connection.execute(
+                "SELECT record_state FROM cards WHERE id = ?", (draft.id,)
+            ).fetchone()
+            indexed = connection.execute(
+                "SELECT count(*) FROM cards_fts WHERE card_id = ?", (draft.id,)
+            ).fetchone()
+        self.assertEqual(state, ("saved",))
+        self.assertEqual(indexed, (1,))
+
+    def test_cleanup_drafts_deletes_only_drafts_and_their_images(self) -> None:
+        saved = _card("需要保留的正式资料", suffix="saved")
+        draft_one = _card("异常退出草稿一", suffix="draft-one")
+        draft_two = _card("异常退出草稿二", suffix="draft-two")
+        draft_one.screenshot_path = f"screenshots/{draft_one.id}.png"
+        draft_one.full_screenshot_path = f"screenshots/full_{draft_one.id}.png"
+        draft_two.screenshot_path = f"screenshots/{draft_two.id}.png"
+        draft_two.full_screenshot_path = f"screenshots/full_{draft_two.id}.png"
+        saved_paths = self._write_screenshots(saved)
+        draft_paths = (
+            *self._write_screenshots(draft_one),
+            *self._write_screenshots(draft_two),
+        )
+        self.store.add_card(saved)
+        self.store.add_draft(draft_one)
+        self.store.add_draft(draft_two)
+
+        self.assertEqual(self.store.cleanup_drafts(), 2)
+
+        self.assertEqual(self.store.get_card(saved.id), saved)
+        self.assertTrue(all(path.exists() for path in saved_paths))
+        self.assertTrue(all(not path.exists() for path in draft_paths))
+        self.assertEqual(self.store.cleanup_drafts(), 0)
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            remaining_drafts = connection.execute(
+                "SELECT count(*) FROM cards WHERE record_state = 'draft'"
+            ).fetchone()
+        self.assertEqual(remaining_drafts, (0,))
+
+    def test_cleanup_preflight_rejects_tampered_database_path_without_partial_delete(
+        self,
+    ) -> None:
+        safe_draft = _card("应保留到人工处理的草稿", suffix="safe-preflight")
+        tampered = _card("被篡改的草稿", suffix="tampered-preflight")
+        for card in (safe_draft, tampered):
+            card.screenshot_path = f"screenshots/{card.id}.png"
+            card.full_screenshot_path = f"screenshots/full_{card.id}.png"
+            self._write_screenshots(card)
+            self.store.add_draft(card)
+        safe_paths = (
+            self.data_dir / safe_draft.screenshot_path,
+            self.data_dir / safe_draft.full_screenshot_path,
+        )
+        with closing(sqlite3.connect(self.store.db_path)) as connection, connection:
+            connection.execute(
+                "UPDATE cards SET screenshot_path = 'cards.sqlite3' WHERE id = ?",
+                (tampered.id,),
+            )
+
+        with self.assertRaisesRegex(StoreError, "安全清理规范"):
+            self.store.cleanup_drafts()
+
+        self.assertTrue(self.store.db_path.is_file())
+        self.assertTrue(all(path.is_file() for path in safe_paths))
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            remaining = connection.execute(
+                "SELECT count(*) FROM cards WHERE record_state = 'draft'"
+            ).fetchone()
+        self.assertEqual(remaining, (2,))
+
+    def test_cleanup_never_deletes_database_even_if_it_has_canonical_png_name(
+        self,
+    ) -> None:
+        draft = _card("数据库路径伪装成截图", suffix="database-disguise")
+        draft.screenshot_path = f"screenshots/{draft.id}.png"
+        draft.full_screenshot_path = f"screenshots/full_{draft.id}.png"
+        disguised_database = self.data_dir / draft.screenshot_path
+        dangerous_store = Store(disguised_database, self.data_dir)
+        dangerous_store.init_db()
+        dangerous_store.add_draft(draft)
+
+        with self.assertRaisesRegex(StoreError, "指向本地数据库"):
+            dangerous_store.cleanup_drafts()
+
+        self.assertTrue(disguised_database.is_file())
+        with closing(sqlite3.connect(disguised_database)) as connection:
+            remaining = connection.execute(
+                "SELECT count(*) FROM cards WHERE id = ?", (draft.id,)
+            ).fetchone()
+        self.assertEqual(remaining, (1,))
+
     def test_add_and_get_preserve_full_card_contract(self) -> None:
         card = _card("本地数据默认不上传", suffix="one", title="隐私原则")
 
@@ -72,6 +271,23 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(saved, card)
         self.assertEqual(loaded, card)
+
+    def test_round_trip_preserves_separate_edited_text(self) -> None:
+        base = _card("OCR 最初提取的文字", suffix="edited")
+        card = Card(
+            **{
+                **base.model_dump(),
+                "edited_text": "审核后的可读文字",
+            }
+        )
+
+        self.store.add_card(card)
+
+        loaded = self.store.get_card(card.id)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.text, "OCR 最初提取的文字")
+        self.assertEqual(loaded.edited_text, "审核后的可读文字")
 
     def test_duplicate_id_is_rejected(self) -> None:
         card = _card("重复卡片", suffix="duplicate")
@@ -135,14 +351,16 @@ class StoreTests(unittest.TestCase):
 
         updated = self.store.update_card(
             card.id,
-            text="新的可检索观点",
+            edited_text="新的可检索观点",
             stance="doubt",
             note="需要来源核查",
         )
 
         self.assertEqual(updated.stance, "doubt")
+        self.assertEqual(updated.text, "旧的关键词")
+        self.assertEqual(updated.edited_text, "新的可检索观点")
         self.assertEqual(self.store.get_card(card.id), updated)
-        self.assertEqual(self.store.search("旧的关键词"), [])
+        self.assertEqual([item.id for item in self.store.search("旧的关键词")], [card.id])
         self.assertEqual([item.id for item in self.store.search("可检索观点")], [card.id])
         self.assertEqual([item.id for item in self.store.search("来源核查")], [card.id])
 
@@ -156,6 +374,8 @@ class StoreTests(unittest.TestCase):
             self.store.update_card(card.id, confidence=2.0)
         with self.assertRaises(StoreError):
             self.store.update_card(card.id, unexpected="value")
+        with self.assertRaises(StoreError):
+            self.store.update_card(card.id, text="不允许覆盖原始提取文字")
         self.assertEqual(self.store.get_card(card.id), card)
 
     def test_delete_removes_card_fts_and_both_screenshots(self) -> None:
@@ -171,6 +391,30 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get_card(card.id))
         self.assertEqual(self.store.search("不可检索"), [])
         self.assertFalse(self.store.delete_card(card.id))
+
+    def test_delete_draft_never_deletes_saved_card_or_evidence(self) -> None:
+        card = _card("正式卡片不能被草稿回滚误删", suffix="saved-protected")
+        selected, full = self._write_screenshots(card)
+        self.store.add_card(card)
+
+        self.assertFalse(self.store.delete_draft(card.id))
+
+        self.assertEqual(self.store.get_card(card.id), card)
+        self.assertTrue(selected.is_file())
+        self.assertTrue(full.is_file())
+
+    def test_delete_draft_removes_only_matching_draft(self) -> None:
+        draft = _card("保存阶段短暂草稿", suffix="draft-delete")
+        draft.screenshot_path = f"screenshots/{draft.id}.png"
+        draft.full_screenshot_path = f"screenshots/full_{draft.id}.png"
+        selected, full = self._write_screenshots(draft)
+        self.store.add_draft(draft)
+
+        self.assertTrue(self.store.delete_draft(draft.id))
+
+        self.assertFalse(selected.exists())
+        self.assertFalse(full.exists())
+        self.assertFalse(self.store.delete_draft(draft.id))
 
     def test_delete_handles_same_screenshot_path_once(self) -> None:
         card = _card("共享同一截图路径", suffix="same")
@@ -204,6 +448,58 @@ class StoreTests(unittest.TestCase):
                 (card.id,),
             ).fetchone()[0]
         self.assertEqual(remaining, 1)
+
+    def test_delete_refuses_path_inside_data_but_outside_screenshot_root(self) -> None:
+        card = _card("截图根目录边界", suffix="outside-screenshot-root")
+        card.screenshot_path = "other/evidence.png"
+        card.full_screenshot_path = "other/full_evidence.png"
+        selected, full = self._write_screenshots(card)
+        self.store.add_card(card)
+
+        with self.assertRaisesRegex(StoreError, "受控截图目录"):
+            self.store.delete_card(card.id)
+
+        self.assertTrue(selected.is_file())
+        self.assertTrue(full.is_file())
+        self.assertEqual(self.store.get_card(card.id), card)
+
+    def test_delete_refuses_screenshot_referenced_by_another_card(self) -> None:
+        first = _card("第一张卡片", suffix="shared-first")
+        second = _card("第二张卡片", suffix="shared-second")
+        second.screenshot_path = first.screenshot_path
+        first_paths = self._write_screenshots(first)
+        self._write_screenshots(second)
+        self.store.add_card(first)
+        self.store.add_card(second)
+
+        with self.assertRaisesRegex(StoreError, "其他记录引用"):
+            self.store.delete_card(first.id)
+
+        self.assertTrue(all(path.is_file() for path in first_paths))
+        self.assertEqual(self.store.get_card(first.id), first)
+        self.assertEqual(self.store.get_card(second.id), second)
+
+    def test_cleanup_refuses_draft_path_referenced_by_saved_card(self) -> None:
+        draft = _card("待清理草稿", suffix="draft-cross-reference")
+        draft.screenshot_path = f"screenshots/{draft.id}.png"
+        draft.full_screenshot_path = f"screenshots/full_{draft.id}.png"
+        saved = _card("仍需保留的卡片", suffix="saved-cross-reference")
+        saved.screenshot_path = draft.screenshot_path
+        draft_paths = self._write_screenshots(draft)
+        self._write_screenshots(saved)
+        self.store.add_draft(draft)
+        self.store.add_card(saved)
+
+        with self.assertRaisesRegex(StoreError, "其他记录引用"):
+            self.store.cleanup_drafts()
+
+        self.assertTrue(all(path.is_file() for path in draft_paths))
+        self.assertEqual(self.store.get_card(saved.id), saved)
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            draft_exists = connection.execute(
+                "SELECT count(*) FROM cards WHERE id = ?", (draft.id,)
+            ).fetchone()
+        self.assertEqual(draft_exists, (1,))
 
     def test_pagination_rejects_unbounded_or_invalid_values(self) -> None:
         for limit, offset in ((0, 0), (501, 0), (True, 0), (10, -1)):

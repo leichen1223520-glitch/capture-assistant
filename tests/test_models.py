@@ -39,6 +39,7 @@ class CardTests(unittest.TestCase):
         self.assertIsNotNone(created_at.utcoffset())
         self.assertEqual(card.stance, "unknown")
         self.assertEqual(card.note, "")
+        self.assertIsNone(card.edited_text)
         self.assertIsNone(card.source_url)
         self.assertIsNone(card.source_title)
         self.assertIsNone(card.video_time)
@@ -71,6 +72,25 @@ class CardTests(unittest.TestCase):
         self.assertIsInstance(card.monitor, dict)
         self.assertEqual(card.stance, "agree")
         self.assertEqual(card.note, "这条观点值得继续验证。")
+
+    def test_original_text_is_frozen_and_edited_text_is_separate(self) -> None:
+        card = Card(**_minimal_card_data())
+
+        card.edited_text = "用户审核后修正的文字"
+
+        self.assertEqual(card.text, "技术应当服务于人的判断。")
+        self.assertEqual(card.edited_text, "用户审核后修正的文字")
+        with self.assertRaises(ValidationError):
+            card.text = "试图覆盖原始文字"
+
+    def test_explicit_edited_text_is_preserved(self) -> None:
+        card = Card(
+            **_minimal_card_data(),
+            edited_text="人工校对后的文字",
+        )
+
+        self.assertEqual(card.text, "技术应当服务于人的判断。")
+        self.assertEqual(card.edited_text, "人工校对后的文字")
 
     def test_accepts_supported_stances_and_confidence_boundaries(self) -> None:
         """所有约定态度及置信度边界值都应合法。"""

@@ -24,7 +24,7 @@ from app.config import WS_PORT
 
 
 LOOPBACK_HOST = "127.0.0.1"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_MESSAGE_BYTES = 64 * 1024
 
 _HELLO_TIMEOUT_SECONDS = 3.0
@@ -50,6 +50,7 @@ class BrowserContext:
     title: str
     selection: str
     video_time: float | None
+    sensitive_input: bool = False
 
 
 class BrowserBridgeError(RuntimeError):
@@ -127,7 +128,15 @@ def _validate_hello(message: dict[str, Any]) -> None:
 def _validate_context(message: dict[str, Any]) -> tuple[str, BrowserContext]:
     _require_exact_keys(
         message,
-        {"type", "request_id", "url", "title", "selection", "video_time"},
+        {
+            "type",
+            "request_id",
+            "url",
+            "title",
+            "selection",
+            "video_time",
+            "sensitive_input",
+        },
     )
     if message["type"] != "context":
         raise _ProtocolError("上下文消息类型不合法")
@@ -140,6 +149,11 @@ def _validate_context(message: dict[str, Any]) -> tuple[str, BrowserContext]:
     selection = _require_bounded_string(
         message["selection"], maximum=_MAX_SELECTION_LENGTH, field="selection"
     )
+    sensitive_input = message["sensitive_input"]
+    if type(sensitive_input) is not bool:
+        raise _ProtocolError("sensitive_input 必须是布尔值")
+    if sensitive_input and selection:
+        raise _ProtocolError("敏感输入聚焦时 selection 必须为空")
 
     raw_video_time = message["video_time"]
     if raw_video_time is None:
@@ -158,6 +172,7 @@ def _validate_context(message: dict[str, Any]) -> tuple[str, BrowserContext]:
         title=title,
         selection=selection,
         video_time=video_time,
+        sensitive_input=sensitive_input,
     )
 
 
