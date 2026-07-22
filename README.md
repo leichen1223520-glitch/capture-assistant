@@ -186,7 +186,8 @@ RapidOCR 首次初始化可能比普通模块导入慢；OCR 模型必须保持�
 3. 点击“加载已解压的扩展程序”；
 4. 选择 `D:\codex projects\capture_assistant\extension`；
 5. 打开一个普通 `http://` 或 `https://` 页面，选中一段文字；若页面含视频，可先播放到任意时间；
-6. 回到 PowerShell 按回车，检查 URL、标题、选中文字和视频时间码是否正确。
+6. 回到 PowerShell 按回车，然后在 5 秒内立即切回刚才的 Chrome 页面，并让 Chrome 保持在前台；
+7. 等待读取完成后再回到 PowerShell，检查 URL、标题、选中文字和视频时间码是否正确。
 
 扩展不申请 `tabs`、Cookie、网络拦截或文件访问权限，但为了在用户从桌面端主动采集时读取当前网页，它需要把只读内容脚本注入普通 HTTP/HTTPS 页面。扩展只连接 `ws://127.0.0.1:8765`，只在桌面端发出 `get_context` 请求时读取页面内容；普通网页 Origin 会被本机桥拒绝。
 
