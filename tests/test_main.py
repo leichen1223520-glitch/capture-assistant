@@ -123,6 +123,61 @@ class _FakeHotkey(QObject):
         self.is_started = False
 
 
+class _FakeApiServer:
+    def __init__(self, store: Store, events: list[str]) -> None:
+        self.store = store
+        self.events = events
+        self.running = False
+
+    def start(self, timeout: float = 5.0) -> "_FakeApiServer":
+        del timeout
+        self.events.append("api_start")
+        self.running = True
+        return self
+
+    def stop(self, timeout: float = 5.0) -> None:
+        del timeout
+        self.events.append("api_stop")
+        self.running = False
+
+
+
+class _FakeLibrary:
+    instances: list["_FakeLibrary"] = []
+
+    def __init__(self, store: Store, *, data_dir: Path) -> None:
+        self.store = store
+        self.data_dir = data_dir
+        self.busy = False
+        self.request_refresh_calls = 0
+        self.show_calls = 0
+        self.hidden = False
+        self.wait_result = True
+        type(self).instances.append(self)
+
+    def request_refresh(self) -> bool:
+        self.request_refresh_calls += 1
+        return True
+
+    def show(self) -> None:
+        self.show_calls += 1
+
+    def raise_(self) -> None:
+        return None
+
+    def activateWindow(self) -> None:
+        return None
+
+    def close(self) -> bool:
+        return True
+
+    def wait_for_idle(self, timeout_ms: int = -1) -> bool:
+        del timeout_ms
+        return self.wait_result
+
+    def hide(self) -> None:
+        self.hidden = True
+
 class CaptureCoordinatorTests(unittest.TestCase):
     application: QApplication
 
@@ -874,6 +929,7 @@ class DesktopRuntimeTests(unittest.TestCase):
         self.events: list[str] = []
         _FakeHotkey.instances.clear()
         _FakeHotkey.fail_on_start = False
+        _FakeLibrary.instances.clear()
 
     def tearDown(self) -> None:
         self.application.processEvents()
@@ -887,6 +943,8 @@ class DesktopRuntimeTests(unittest.TestCase):
             db_path=self.data_dir / "cards.sqlite3",
             bridge_start=lambda: self.events.append("bridge_start"),
             bridge_stop=lambda: self.events.append("bridge_stop"),
+            api_server_factory=lambda store: _FakeApiServer(store, self.events),
+            library_factory=_FakeLibrary,
         )
 
     def test_start_and_shutdown_own_bridge_hotkey_tray_and_database(self) -> None:
@@ -899,7 +957,7 @@ class DesktopRuntimeTests(unittest.TestCase):
 
             runtime.shutdown()
 
-        self.assertEqual(self.events, ["bridge_start", "bridge_stop"])
+        self.assertEqual(self.events, ["bridge_start", "api_start", "api_stop", "bridge_stop"])
         self.assertEqual(_FakeHotkey.instances[-1].stop_calls, 1)
         self.assertFalse(runtime.tray_icon.isVisible())
 
@@ -910,9 +968,42 @@ class DesktopRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(HotkeyError, "快捷键冲突"):
                 runtime.start()
 
-        self.assertEqual(self.events, ["bridge_start", "bridge_stop"])
+        self.assertEqual(self.events, ["bridge_start", "api_start", "api_stop", "bridge_stop"])
         self.assertFalse(runtime.tray_icon.isVisible())
 
+    def test_tray_opens_one_library_window_and_readonly_browser(self) -> None:
+        with (
+            patch("app.main.HotkeyManager", _FakeHotkey),
+            patch("app.main.QDesktopServices.openUrl", return_value=True) as open_url,
+        ):
+            runtime = self._runtime()
+            runtime.start()
+            runtime._show_library()
+            runtime._show_library()
+            runtime._open_readonly_search()
+
+            self.assertEqual(len(_FakeLibrary.instances), 1)
+            library = _FakeLibrary.instances[0]
+            self.assertIs(runtime._library_window, library)
+            self.assertEqual(library.request_refresh_calls, 2)
+            self.assertEqual(library.show_calls, 2)
+            opened_url = open_url.call_args.args[0]
+            self.assertEqual(opened_url.toString(), "http://127.0.0.1:8000/")
+            runtime.shutdown()
+
+        self.assertTrue(library.hidden)
+
+    def test_shutdown_keeps_library_reference_if_its_task_times_out(self) -> None:
+        with patch("app.main.HotkeyManager", _FakeHotkey):
+            runtime = self._runtime()
+            runtime.start()
+            runtime._show_library()
+            library = _FakeLibrary.instances[0]
+            library.wait_result = False
+
+            runtime.shutdown()
+
+        self.assertIs(runtime._library_window, library)
     def test_start_removes_crash_leftover_draft_and_both_images(self) -> None:
         screenshots = self.data_dir / "screenshots"
         screenshots.mkdir(parents=True)

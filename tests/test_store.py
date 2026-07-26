@@ -18,12 +18,14 @@ def _card(
     *,
     suffix: str,
     created_at: str = "2026-07-18T20:00:00+08:00",
+    text_source: str = "ocr",
+    stance: str = "unknown",
     title: str | None = None,
     note: str = "",
 ) -> Card:
     return Card(
         text=text,
-        text_source="ocr",
+        text_source=text_source,
         confidence=0.9,
         screenshot_path=f"screenshots/{suffix}.png",
         full_screenshot_path=f"screenshots/full_{suffix}.png",
@@ -34,6 +36,7 @@ def _card(
         monitor={"width": 1920, "height": 1080, "scale": 1.25},
         created_at=created_at,
         note=note,
+        stance=stance,
     )
 
 
@@ -312,6 +315,46 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(self.store.list_recent(limit=1), [new])
         self.assertEqual(self.store.list_recent(limit=1, offset=1), [old])
+
+    def test_query_cards_filters_in_database_before_limit(self) -> None:
+        matching = _card(
+            "共同关键词：应被找到",
+            suffix="matching",
+            text_source="dom",
+            stance="agree",
+            created_at="2026-07-18T19:00:00+08:00",
+        )
+        newer_nonmatching = _card(
+            "共同关键词：但态度不同",
+            suffix="newer-nonmatching",
+            text_source="ocr",
+            stance="doubt",
+            created_at="2026-07-18T22:00:00+08:00",
+        )
+        self.store.add_card(matching)
+        self.store.add_card(newer_nonmatching)
+
+        result = self.store.query_cards(
+            "共同关键词",
+            stance="agree",
+            text_source="dom",
+            limit=1,
+        )
+
+        self.assertEqual([card.id for card in result], [matching.id])
+        self.assertEqual(
+            [card.id for card in self.store.query_cards(stance="doubt")],
+            [newer_nonmatching.id],
+        )
+        with self.assertRaises(StoreError):
+            self.store.query_cards(stance="invalid")  # type: ignore[arg-type]
+        with self.assertRaises(StoreError):
+            self.store.query_cards(text_source="invalid")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(StoreError, "500"):
+            self.store.query_cards("x" * 501)
+        with self.assertRaisesRegex(StoreError, "500"):
+            self.store.search("x" * 501)
+
 
     def test_searches_text_title_note_and_chinese_short_query(self) -> None:
         text_card = _card("本地优先的观点采集助手", suffix="text")

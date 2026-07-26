@@ -10,8 +10,8 @@ from threading import Lock
 from typing import Protocol
 
 from PIL import Image
-from PySide6.QtCore import QObject, QRect, QRunnable, QThreadPool, Signal, Slot, Qt
-from PySide6.QtGui import QAction, QGuiApplication
+from PySide6.QtCore import QObject, QRect, QRunnable, QThreadPool, QUrl, Signal, Slot, Qt
+from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QMenu,
@@ -37,8 +37,9 @@ from .capture import (
     foreground_window_snapshot,
     grab_active_monitor,
 )
-from .config import DATA_DIR, DB_PATH, HOTKEY, SCREENSHOT_DIR, ensure_data_dirs
+from .config import API_PORT, DATA_DIR, DB_PATH, HOTKEY, SCREENSHOT_DIR, ensure_data_dirs
 from .hotkey import HotkeyError, HotkeyManager
+from .library import LibraryWindow
 from .models import Card
 from .ocr import OCRError
 from .overlay import OverlayError, select_region
@@ -49,6 +50,7 @@ from .safety import (
     is_chromium_application,
     normalize_process_name,
 )
+from .server import LocalApiServer
 from .store import Store, StoreError
 
 LOGGER = logging.getLogger(__name__)
@@ -80,6 +82,12 @@ class _ThreadPoolLike(Protocol):
     def clear(self) -> None: ...
 
     def waitForDone(self, msecs: int = -1) -> bool: ...
+
+
+class _ApiServerLike(Protocol):
+    def start(self, timeout: float = 5.0) -> object: ...
+
+    def stop(self, timeout: float = 5.0) -> None: ...
 
 
 class _CardBuildSignals(QObject):
@@ -588,6 +596,8 @@ class DesktopRuntime(QObject):
         db_path: str | Path = DB_PATH,
         bridge_start: Callable[..., None] = start_browser_bridge,
         bridge_stop: Callable[..., None] = stop_browser_bridge,
+        api_server_factory: Callable[[Store], _ApiServerLike] = LocalApiServer,
+        library_factory: Callable[..., LibraryWindow] = LibraryWindow,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -597,6 +607,10 @@ class DesktopRuntime(QObject):
         self.store = Store(db_path=db_path, data_dir=self.data_dir)
         self.bridge_start = bridge_start
         self.bridge_stop = bridge_stop
+        self.api_server_factory = api_server_factory
+        self.library_factory = library_factory
+        self.api_server: _ApiServerLike | None = None
+        self._library_window: LibraryWindow | None = None
         self.hotkey = HotkeyManager(HOTKEY, parent=self)
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setToolTip("本地屏幕内容与观点采集助手")
@@ -605,10 +619,12 @@ class DesktopRuntime(QObject):
         )
         self.menu = QMenu()
         self.capture_action = QAction(f"开始捕获（{HOTKEY}）", self.menu)
-        self.search_action = QAction("打开搜索", self.menu)
+        self.search_action = QAction("打开观点库", self.menu)
         self.quit_action = QAction("退出", self.menu)
+        self.readonly_search_action = QAction("打开只读检索网页", self.menu)
         self.menu.addAction(self.capture_action)
         self.menu.addAction(self.search_action)
+        self.menu.addAction(self.readonly_search_action)
         self.menu.addSeparator()
         self.menu.addAction(self.quit_action)
         self.tray_icon.setContextMenu(self.menu)
@@ -622,7 +638,8 @@ class DesktopRuntime(QObject):
         )
         self.hotkey.activated.connect(self.coordinator.request_capture)
         self.capture_action.triggered.connect(self.coordinator.request_capture)
-        self.search_action.triggered.connect(self._show_search_placeholder)
+        self.search_action.triggered.connect(self._show_library)
+        self.readonly_search_action.triggered.connect(self._open_readonly_search)
         self.quit_action.triggered.connect(self.request_quit)
         self.tray_icon.activated.connect(self._tray_activated)
         self.application.aboutToQuit.connect(self.shutdown)
@@ -630,7 +647,7 @@ class DesktopRuntime(QObject):
         self._stopped = False
 
     def start(self) -> None:
-        """初始化数据库、桥与热键，任一步失败都会回滚已启动资源。"""
+        """初始化数据库、桥、只读服务与热键，失败时回滚已启动资源。"""
 
         if self._started:
             return
@@ -642,8 +659,17 @@ class DesktopRuntime(QObject):
         try:
             self.bridge_start()
             bridge_started = True
+            self.api_server = self.api_server_factory(self.store)
+            self.api_server.start()
             self.hotkey.start()
         except Exception:
+            if self.api_server is not None:
+                try:
+                    self.api_server.stop()
+                except RuntimeError:
+                    LOGGER.exception("启动回滚时无法停止本机只读检索服务")
+                else:
+                    self.api_server = None
             if bridge_started:
                 try:
                     self.bridge_stop()
@@ -671,6 +697,17 @@ class DesktopRuntime(QObject):
                 5_000,
             )
             return
+        library = self._library_window
+        if library is not None and library.busy:
+            self.tray_icon.showMessage(
+                "观点库仍在处理",
+                "请等待当前保存、删除或导出结束后再退出。",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5_000,
+            )
+            return
+        if library is not None and not library.close():
+            return
         self.application.quit()
 
     @Slot(QSystemTrayIcon.ActivationReason)
@@ -679,16 +716,59 @@ class DesktopRuntime(QObject):
             self.coordinator.request_capture()
 
     @Slot()
-    def _show_search_placeholder(self) -> None:
-        QMessageBox.information(
-            None,
-            "本地搜索",
-            "卡片采集与审核已经可用；本地搜索界面将在下一阶段 T8 开放。",
-        )
+    def _show_library(self) -> None:
+        try:
+            if self._library_window is None:
+                self._library_window = self.library_factory(
+                    self.store,
+                    data_dir=self.data_dir,
+                )
+            window = self._library_window
+            if not window.busy:
+                window.request_refresh()
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            LOGGER.warning(
+                "无法打开本地观点库：%s",
+                type(exc).__name__,
+            )
+            self._notify(
+                "无法打开观点库",
+                "本地观点库暂时无法打开，请查看终端后重试。",
+                warning=True,
+            )
+
+    @Slot()
+    def _open_readonly_search(self) -> None:
+        server = self.api_server
+        if (
+            server is None
+            or not bool(getattr(server, "running", False))
+        ):
+            self._notify(
+                "只读检索尚未启动",
+                "请重新启动采集助手后再打开本地检索网页。",
+                warning=True,
+            )
+            return
+        url = QUrl(f"http://127.0.0.1:{API_PORT}/")
+        if not QDesktopServices.openUrl(url):
+            self._notify(
+                "无法打开只读网页",
+                "系统浏览器未能打开本机观点库地址。",
+                warning=True,
+            )
 
     @Slot()
     def shutdown(self) -> None:
-        """按安全顺序停止采集、快捷键、桥和托盘。"""
+        """按安全顺序停止采集、观点库、只读服务、快捷键和浏览器桥。"""
 
         if self._stopped:
             return
@@ -699,11 +779,27 @@ class DesktopRuntime(QObject):
                 "退出前未能完整结束本地识别或清理保存阶段草稿；"
                 "审核前候选仍只在内存，异常草稿会在下次启动时再次清理"
             )
+        library = self._library_window
+        if library is not None:
+            if not library.wait_for_idle(10_000):
+                LOGGER.warning("退出前未能在限定时间内结束观点库后台任务")
+            else:
+                library.hide()
+                self._library_window = None
+
         if self.hotkey.is_started:
             try:
                 self.hotkey.stop()
             except HotkeyError:
                 LOGGER.exception("退出时无法注销全局快捷键")
+        if self.api_server is not None:
+            try:
+                self.api_server.stop()
+            except RuntimeError:
+                LOGGER.exception("退出时无法停止本机只读检索服务")
+            finally:
+                self.api_server = None
+
         if self._started:
             try:
                 self.bridge_stop()
@@ -727,7 +823,7 @@ def _create_application(argv: list[str]) -> QApplication:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """启动 T7 桌面应用并返回 Qt 退出码。"""
+    """启动 T8 桌面应用并返回 Qt 退出码。"""
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     application = _create_application(list(sys.argv if argv is None else argv))

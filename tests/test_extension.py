@@ -18,6 +18,7 @@ def test_manifest_uses_only_required_http_https_content_access() -> None:
     assert int(manifest["minimum_chrome_version"]) >= 116
     assert manifest.get("permissions", []) == []
     assert manifest.get("host_permissions", []) == []
+    assert manifest["action"] == {"default_title": "连接本地采集助手"}
     assert manifest["background"] == {"service_worker": "background.js"}
     assert manifest["content_scripts"] == [
         {
@@ -44,6 +45,18 @@ def test_background_connects_only_to_loopback_and_requires_focused_window() -> N
     assert "new TextEncoder()" in source
     assert "KEEPALIVE_INTERVAL_MS = 20_000" in source
     assert "const PROTOCOL_VERSION = 2" in source
+
+
+def test_background_stops_after_bounded_retry_burst_and_supports_manual_retry() -> None:
+    source = (EXTENSION_DIR / "background.js").read_text(encoding="utf-8")
+
+    assert "const MAX_RECONNECT_ATTEMPTS = 3" in source
+    assert "RECONNECT_COOLDOWN_MS" not in source
+    assert "桌面端未连接；点击图标重新连接" in source
+    assert "chrome.action.onClicked.addListener" in source
+    assert "if (socket !== candidate)" in source
+    assert "candidate.close();" not in source
+    assert source.rstrip().endswith("connect();")
 
 
 def test_background_requires_boolean_sensitive_flag_and_clears_selection() -> None:

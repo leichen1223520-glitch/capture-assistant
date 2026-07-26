@@ -4,21 +4,27 @@ const BRIDGE_URL = "ws://127.0.0.1:8765";
 const PROTOCOL_VERSION = 2;
 const KEEPALIVE_INTERVAL_MS = 20_000;
 const STABLE_CONNECTION_MS = 60_000;
-const MAX_RECONNECT_ATTEMPTS = 8;
+const MAX_RECONNECT_ATTEMPTS = 3;
 const MAX_RECONNECT_DELAY_MS = 30_000;
-const RECONNECT_COOLDOWN_MS = 5 * 60_000;
 const MAX_PROTOCOL_MESSAGE_BYTES = 60 * 1_024;
 const URL_JSON_BYTES = 12 * 1_024;
 const TITLE_JSON_BYTES = 8 * 1_024;
 const SELECTION_JSON_BYTES = 36 * 1_024;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UTF8_ENCODER = new TextEncoder();
+const ACTION_TITLE_CONNECTING = "正在连接本地采集助手";
+const ACTION_TITLE_CONNECTED = "已连接本地采集助手";
+const ACTION_TITLE_WAITING = "桌面端未连接；点击图标重新连接";
 
 let socket = null;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let keepaliveTimer = null;
 let stableConnectionTimer = null;
+
+function updateActionTitle(title) {
+  void chrome.action.setTitle({ title }).catch(() => {});
+}
 
 function clearConnectionTimers() {
   if (keepaliveTimer !== null) {
@@ -28,6 +34,13 @@ function clearConnectionTimers() {
   if (stableConnectionTimer !== null) {
     clearTimeout(stableConnectionTimer);
     stableConnectionTimer = null;
+  }
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
 }
 
@@ -49,13 +62,12 @@ function scheduleReconnect() {
     return;
   }
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    reconnectTimer = setTimeout(() => {
-      reconnectAttempts = 0;
-      reconnectTimer = null;
-      connect();
-    }, RECONNECT_COOLDOWN_MS);
+    // MV3 Service Worker 休眠后不会保证长 setTimeout 继续执行。
+    // 停止后台探测可避免桌面端关闭时不断制造连接错误；用户点击图标即可重连。
+    updateActionTitle(ACTION_TITLE_WAITING);
     return;
   }
+  updateActionTitle(ACTION_TITLE_CONNECTING);
   const delay = Math.min(
     1_000 * (2 ** reconnectAttempts),
     MAX_RECONNECT_DELAY_MS,
@@ -242,6 +254,8 @@ function connect() {
   socket = candidate;
 
   candidate.addEventListener("open", () => {
+    clearConnectionTimers();
+    updateActionTitle(ACTION_TITLE_CONNECTED);
     sendJson(candidate, { type: "hello", protocol: PROTOCOL_VERSION });
     keepaliveTimer = setInterval(() => {
       sendJson(candidate, { type: "ping" });
@@ -256,17 +270,30 @@ function connect() {
     handleBridgeMessage(candidate, event);
   });
 
-  candidate.addEventListener("error", () => {
-    candidate.close();
-  });
+  // 失败握手后 Chrome 会自行触发 close。不要在 CONNECTING 状态再次
+  // close，否则可能额外产生一条控制台错误。
+  candidate.addEventListener("error", () => {});
 
   candidate.addEventListener("close", () => {
-    if (socket === candidate) {
-      socket = null;
+    if (socket !== candidate) {
+      return;
     }
+    socket = null;
     clearConnectionTimers();
     scheduleReconnect();
   });
 }
 
+chrome.action.onClicked.addListener(() => {
+  if (socket !== null && socket.readyState === WebSocket.OPEN) {
+    updateActionTitle(ACTION_TITLE_CONNECTED);
+    return;
+  }
+  clearReconnectTimer();
+  reconnectAttempts = 0;
+  updateActionTitle(ACTION_TITLE_CONNECTING);
+  connect();
+});
+
+updateActionTitle(ACTION_TITLE_CONNECTING);
 connect();

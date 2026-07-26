@@ -16,10 +16,11 @@ from typing import Any, Final
 from pydantic import ValidationError
 
 from .config import DATA_DIR, DB_PATH
-from .models import Card
+from .models import Card, Stance, TextSource
 
 FTS_TOKENIZERS: Final = ("trigram", "unicode61")
 RECORD_STATES: Final = ("draft", "saved")
+MAX_QUERY_CHARACTERS: Final = 500
 UPDATABLE_FIELDS: Final = frozenset(
     {
         "edited_text",
@@ -508,6 +509,93 @@ class Store:
             raise StoreError("无法列出本地卡片。") from exc
         return [self._row_to_card(row) for row in rows]
 
+    def list_saved_snapshot(self, limit: int = 2_001) -> list[Card]:
+        """用单个 SQLite 读语句返回一致快照，供有上限的只读导出。"""
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 10_000
+        ):
+            raise StoreError("快照上限需为 1–10000。")
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM cards
+                    WHERE record_state = 'saved'
+                    ORDER BY datetime(created_at) DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreError("无法创建本地卡片导出快照。") from exc
+        return [self._row_to_card(row) for row in rows]
+
+    def query_cards(
+        self,
+        query: str = "",
+        *,
+        stance: Stance | None = None,
+        text_source: TextSource | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[Card]:
+        """按文字、态度和来源在数据库内筛选，避免先分页再筛选漏项。"""
+
+        self._validate_page(limit, offset)
+        if not isinstance(query, str):
+            raise StoreError("搜索词必须是字符串。")
+        if stance is not None and stance not in (
+            "unknown",
+            "agree",
+            "disagree",
+            "doubt",
+            "useful",
+        ):
+            raise StoreError("态度筛选值无效。")
+        if text_source is not None and text_source not in ("dom", "ocr"):
+            raise StoreError("文字来源筛选值无效。")
+
+        normalized = " ".join(query.split())
+        if "\x00" in normalized:
+            raise StoreError("搜索词包含无效字符。")
+        if len(normalized) > MAX_QUERY_CHARACTERS:
+            raise StoreError("搜索词不能超过 500 个字符。")
+        clauses = ["record_state = 'saved'"]
+        parameters: list[object] = []
+        if stance is not None:
+            clauses.append("stance = ?")
+            parameters.append(stance)
+        if text_source is not None:
+            clauses.append("text_source = ?")
+            parameters.append(text_source)
+        if normalized:
+            clauses.append(
+                "("
+                "instr(lower(text), lower(?)) > 0 OR "
+                "instr(lower(COALESCE(edited_text, '')), lower(?)) > 0 OR "
+                "instr(lower(COALESCE(source_title, '')), lower(?)) > 0 OR "
+                "instr(lower(note), lower(?)) > 0"
+                ")"
+            )
+            parameters.extend([normalized] * 4)
+        parameters.extend([limit, offset])
+
+        statement = f"""
+            SELECT * FROM cards
+            WHERE {' AND '.join(clauses)}
+            ORDER BY datetime(created_at) DESC, rowid DESC
+            LIMIT ? OFFSET ?
+        """
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(statement, parameters).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreError("无法筛选本地卡片。") from exc
+        return [self._row_to_card(row) for row in rows]
+
     @staticmethod
     def _validate_page(limit: int, offset: int) -> None:
         if (
@@ -529,6 +617,8 @@ class Store:
             return []
         if "\x00" in normalized:
             raise StoreError("搜索词包含无效字符。")
+        if len(normalized) > MAX_QUERY_CHARACTERS:
+            raise StoreError("搜索词不能超过 500 个字符。")
 
         try:
             with closing(self._connect()) as connection:
