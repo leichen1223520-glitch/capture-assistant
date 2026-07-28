@@ -29,7 +29,7 @@
     <p id="videoStatus">正在生成约 8 秒的本机测试视频，请稍候……</p>
     <video controls loop muted></video>
     <canvas width="640" height="360" hidden></canvas>
-    <p>视频开始循环播放后，在任意明显时间点捕获；审核窗应显示接近当时的秒数。</p>
+    <p>视频开始循环播放后，可主动捕获验证时间码；也可从托盘开始半自动观察，框住视频区域，原生测试字幕应逐条进入内存收件箱。</p>
   </section>
 
   <section>
@@ -84,7 +84,12 @@
         cancelAnimationFrame(animationId);
         stream.getTracks().forEach((track) => track.stop());
         video.src = URL.createObjectURL(new Blob(chunks, { type: recorder.mimeType || "video/webm" }));
-        status.textContent = "本机测试视频已生成并开始循环播放。";
+        const subtitleTrack = video.addTextTrack("captions", "半自动观察测试字幕", "zh-CN");
+        subtitleTrack.mode = "showing";
+        subtitleTrack.addCue(new VTTCue(0.0, 2.6, "第一条测试字幕：先保留证据，再判断观点。"));
+        subtitleTrack.addCue(new VTTCue(2.7, 5.3, "第二条测试字幕：候选只在内存中等待审核。"));
+        subtitleTrack.addCue(new VTTCue(5.4, 8.0, "第三条测试字幕：保存行为不等于认同。"));
+        status.textContent = "本机测试视频和三条原生字幕已生成并开始循环播放。";
         try { await video.play(); } catch (_error) { status.textContent += " 请手动点击播放。"; }
       };
 

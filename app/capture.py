@@ -394,6 +394,72 @@ def grab_active_monitor() -> tuple[Image.Image, CaptureMeta]:
     return image, meta
 
 
+def grab_monitor(capture_meta: CaptureMeta) -> tuple[Image.Image, CaptureMeta]:
+    """按既有显示器几何重新抓帧，供用户明确开始的观察会话使用。
+
+    观察期间不跟随鼠标切换显示器；若可确认的设备身份、显示器布局或分辨率
+    发生变化则拒绝抓取，避免把固定选区套用到另一块画面。返回的时间与前台
+    应用会按本次抓帧刷新。
+    """
+
+    if not isinstance(capture_meta, CaptureMeta):
+        raise CaptureError("固定显示器捕获需要合法的 CaptureMeta。")
+    _require_windows()
+    enable_per_monitor_dpi_awareness()
+
+    try:
+        from mss import mss
+        from mss.exception import ScreenShotError
+    except ImportError as exc:
+        raise CaptureError("缺少 mss，无法执行本地屏幕捕获。") from exc
+
+    try:
+        with mss() as capture:
+            monitors = capture.monitors
+            index = capture_meta.monitor_index
+            if not 1 <= index < len(monitors):
+                raise CaptureError("观察显示器已断开或编号发生变化。")
+            monitor = monitors[index]
+            geometry = (
+                int(monitor["left"]),
+                int(monitor["top"]),
+                int(monitor["width"]),
+                int(monitor["height"]),
+            )
+            expected = (
+                capture_meta.left,
+                capture_meta.top,
+                capture_meta.width,
+                capture_meta.height,
+            )
+            if geometry != expected:
+                raise CaptureError("观察期间显示器布局或分辨率发生变化。")
+            if capture_meta.device_name is not None:
+                center_x = geometry[0] + max(0, geometry[2] // 2)
+                center_y = geometry[1] + max(0, geometry[3] // 2)
+                current_device_name = _monitor_device_name(center_x, center_y)
+                if current_device_name != capture_meta.device_name:
+                    raise CaptureError("观察显示器设备身份发生变化。")
+            shot = capture.grab(monitor)
+            image = Image.frombytes("RGB", shot.size, shot.rgb)
+    except CaptureError:
+        raise
+    except (ScreenShotError, OSError) as exc:
+        raise CaptureError(f"屏幕捕获失败：{exc}") from exc
+
+    return image, CaptureMeta(
+        monitor_index=capture_meta.monitor_index,
+        left=capture_meta.left,
+        top=capture_meta.top,
+        width=image.width,
+        height=image.height,
+        scale=capture_meta.scale,
+        device_name=capture_meta.device_name,
+        app_name=foreground_app_name(),
+        captured_at=datetime.now().astimezone().isoformat(),
+    )
+
+
 def save_image(image: Image.Image, path: str | Path) -> Path:
     """以 PNG 保存图像，创建必要的父目录并返回规范化路径。"""
 

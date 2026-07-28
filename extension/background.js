@@ -1,15 +1,18 @@
 "use strict";
 
 const BRIDGE_URL = "ws://127.0.0.1:8765";
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const KEEPALIVE_INTERVAL_MS = 20_000;
 const STABLE_CONNECTION_MS = 60_000;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const MAX_PROTOCOL_MESSAGE_BYTES = 60 * 1_024;
-const URL_JSON_BYTES = 12 * 1_024;
-const TITLE_JSON_BYTES = 8 * 1_024;
-const SELECTION_JSON_BYTES = 36 * 1_024;
+const URL_JSON_BYTES = 10 * 1_024;
+const TITLE_JSON_BYTES = 6 * 1_024;
+const SELECTION_JSON_BYTES = 20 * 1_024;
+const OBSERVATION_JSON_BYTES = 20 * 1_024;
+const VIDEO_KEY_JSON_BYTES = 256;
+const OBSERVATION_KINDS = new Set(["none", "selection", "caption"]);
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UTF8_ENCODER = new TextEncoder();
 const ACTION_TITLE_CONNECTING = "正在连接本地采集助手";
@@ -105,8 +108,11 @@ function boundedString(value, maximumCharacters, maximumJsonBytes) {
   return characters.slice(0, lower).join("");
 }
 
-function normalizePageContext(value) {
+function normalizePageContext(value, tabId) {
   if (value === null || typeof value !== "object") {
+    return null;
+  }
+  if (!Number.isInteger(tabId) || tabId < 0) {
     return null;
   }
   if (typeof value.sensitive_input !== "boolean") {
@@ -118,14 +124,34 @@ function normalizePageContext(value) {
     && rawVideoTime >= 0
     ? rawVideoTime
     : null;
+  const sensitiveInput = value.sensitive_input;
+  let observationKind = typeof value.observation_kind === "string"
+    && OBSERVATION_KINDS.has(value.observation_kind)
+    ? value.observation_kind
+    : "none";
+  let observationText = sensitiveInput
+    ? ""
+    : boundedString(value.observation_text, 16_384, OBSERVATION_JSON_BYTES);
+  if (!observationText || observationKind === "none") {
+    observationText = "";
+    observationKind = "none";
+  }
+  const rawVideoKey = boundedString(value.video_key, 128, VIDEO_KEY_JSON_BYTES);
+  const videoKey = /^video-[1-9][0-9]*:[0-9]+$/.test(rawVideoKey)
+    ? rawVideoKey
+    : "";
   return {
     url: boundedString(value.url, 8_192, URL_JSON_BYTES),
     title: boundedString(value.title, 2_048, TITLE_JSON_BYTES),
-    selection: value.sensitive_input
+    selection: sensitiveInput
       ? ""
-      : boundedString(value.selection, 32_768, SELECTION_JSON_BYTES),
+      : boundedString(value.selection, 16_384, SELECTION_JSON_BYTES),
     video_time: videoTime,
-    sensitive_input: value.sensitive_input,
+    sensitive_input: sensitiveInput,
+    tab_id: tabId,
+    observation_text: observationText,
+    observation_kind: observationKind,
+    video_key: videoKey,
   };
 }
 
@@ -166,7 +192,7 @@ async function replyWithContext(target, requestId) {
     const response = await chrome.tabs.sendMessage(activeTab.id, {
       type: "capture_assistant_get_context",
     });
-    const context = normalizePageContext(response);
+    const context = normalizePageContext(response, activeTab.id);
     if (context === null) {
       sendJson(target, {
         type: "context_error",

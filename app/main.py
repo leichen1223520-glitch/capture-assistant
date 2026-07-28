@@ -39,8 +39,11 @@ from .capture import (
 )
 from .config import API_PORT, DATA_DIR, DB_PATH, HOTKEY, SCREENSHOT_DIR, ensure_data_dirs
 from .hotkey import HotkeyError, HotkeyManager
+from .inbox import CandidateInbox
+from .inbox_window import CandidateInboxWindow
 from .library import LibraryWindow
 from .models import Card
+from .observation import ObservationCoordinator
 from .ocr import OCRError
 from .overlay import OverlayError, select_region
 from .pipeline import PipelineError, PreparedCard, prepare_card_from_selection
@@ -605,12 +608,14 @@ class DesktopRuntime(QObject):
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.screenshot_dir = Path(screenshot_dir).expanduser().resolve()
         self.store = Store(db_path=db_path, data_dir=self.data_dir)
+        self.inbox = CandidateInbox()
         self.bridge_start = bridge_start
         self.bridge_stop = bridge_stop
         self.api_server_factory = api_server_factory
         self.library_factory = library_factory
         self.api_server: _ApiServerLike | None = None
         self._library_window: LibraryWindow | None = None
+        self._inbox_window: CandidateInboxWindow | None = None
         self.hotkey = HotkeyManager(HOTKEY, parent=self)
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setToolTip("本地屏幕内容与观点采集助手")
@@ -618,10 +623,18 @@ class DesktopRuntime(QObject):
             application.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         )
         self.menu = QMenu()
+        self.observe_start_action = QAction("开始半自动观察……", self.menu)
+        self.observe_stop_action = QAction("停止半自动观察", self.menu)
+        self.observe_stop_action.setEnabled(False)
+        self.inbox_action = QAction("候选收件箱（0）", self.menu)
         self.capture_action = QAction(f"开始捕获（{HOTKEY}）", self.menu)
         self.search_action = QAction("打开观点库", self.menu)
         self.quit_action = QAction("退出", self.menu)
         self.readonly_search_action = QAction("打开只读检索网页", self.menu)
+        self.menu.addAction(self.observe_start_action)
+        self.menu.addAction(self.observe_stop_action)
+        self.menu.addAction(self.inbox_action)
+        self.menu.addSeparator()
         self.menu.addAction(self.capture_action)
         self.menu.addAction(self.search_action)
         self.menu.addAction(self.readonly_search_action)
@@ -636,8 +649,20 @@ class DesktopRuntime(QObject):
             screenshot_dir=self.screenshot_dir,
             parent=self,
         )
-        self.hotkey.activated.connect(self.coordinator.request_capture)
-        self.capture_action.triggered.connect(self.coordinator.request_capture)
+        self.observation = ObservationCoordinator(
+            self.tray_icon,
+            self._offer_observation_candidate,
+            data_dir=self.data_dir,
+            screenshot_dir=self.screenshot_dir,
+            parent=self,
+        )
+        self.hotkey.activated.connect(self._request_capture)
+        self.capture_action.triggered.connect(self._request_capture)
+        self.observe_start_action.triggered.connect(self._request_observation_start)
+        self.observe_stop_action.triggered.connect(self.observation.request_stop)
+        self.observation.state_changed.connect(self._observation_state_changed)
+        self.observation.candidate_added.connect(self._refresh_inbox)
+        self.inbox_action.triggered.connect(self._show_inbox)
         self.search_action.triggered.connect(self._show_library)
         self.readonly_search_action.triggered.connect(self._open_readonly_search)
         self.quit_action.triggered.connect(self.request_quit)
@@ -645,6 +670,113 @@ class DesktopRuntime(QObject):
         self.application.aboutToQuit.connect(self.shutdown)
         self._started = False
         self._stopped = False
+
+    @Slot()
+    def _request_capture(self) -> None:
+        if self.observation.active or self.observation.busy:
+            self._notify(
+                "观察尚未完全停止",
+                "请先停止半自动观察，并等待当前本地检查结束后再主动捕获。",
+                warning=True,
+            )
+            return
+        self.coordinator.request_capture()
+
+    @Slot()
+    def _request_observation_start(self) -> None:
+        if self.coordinator.busy:
+            self._notify(
+                "暂不能开始观察",
+                "请先完成当前框选、识别或卡片审核。",
+                warning=True,
+            )
+            return
+        self.observation.request_start()
+
+    def _offer_observation_candidate(
+        self,
+        prepared: PreparedCard,
+        *,
+        session_id: str,
+        source_key: str,
+        region_key: str,
+        seen_at: float,
+    ) -> bool:
+        result = self.inbox.offer(
+            prepared,
+            session_id=session_id,
+            source_key=source_key,
+            region_key=region_key,
+            now=seen_at,
+        )
+        # inbox.offer 是不可逆的所有权移交点。此后的 GUI 刷新或托盘通知即使
+        # 失败，也不能让上层误以为移交失败并关闭收件箱仍持有的 PreparedCard。
+        try:
+            self._refresh_inbox()
+            if result.evicted_entry_ids:
+                self._notify(
+                    "收件箱已达到上限",
+                    "已从内存丢弃最旧的未审核候选；没有删除已保存的卡片。",
+                    warning=True,
+                )
+            elif result.status == "too_large":
+                self._notify(
+                    "候选未加入收件箱",
+                    "这张候选超过内存上限，已安全释放且没有落盘。",
+                    warning=True,
+                )
+        except Exception:
+            LOGGER.exception("候选已经安全移交，但收件箱界面刷新失败（未记录正文）")
+        return result.status == "added"
+
+    @Slot(bool)
+    def _observation_state_changed(self, active: bool) -> None:
+        self.observe_start_action.setEnabled(not active)
+        self.observe_stop_action.setEnabled(active)
+        self.capture_action.setEnabled(not active)
+
+    @Slot()
+    def _refresh_inbox(self) -> None:
+        count = len(self.inbox)
+        self.inbox_action.setText(f"候选收件箱（{count}）")
+        window = self._inbox_window
+        if window is not None and window.isVisible():
+            window.refresh()
+
+    @Slot(int)
+    def _set_inbox_count(self, count: int) -> None:
+        self.inbox_action.setText(f"候选收件箱（{count}）")
+
+    @Slot()
+    def _show_inbox(self) -> None:
+        try:
+            if self._inbox_window is None:
+                self._inbox_window = CandidateInboxWindow(
+                    self.inbox,
+                    self.store,
+                    data_dir=self.data_dir,
+                )
+                self._inbox_window.count_changed.connect(self._set_inbox_count)
+            window = self._inbox_window
+            window.refresh()
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            LOGGER.exception("无法打开候选收件箱（未记录候选正文）")
+            self._notify(
+                "无法打开候选收件箱",
+                "本地候选窗口暂时无法打开，请查看终端后重试。",
+                warning=True,
+            )
+
+    def _notify(self, title: str, message: str, *, warning: bool = False) -> None:
+        icon = (
+            QSystemTrayIcon.MessageIcon.Warning
+            if warning
+            else QSystemTrayIcon.MessageIcon.Information
+        )
+        self.tray_icon.showMessage(title, message, icon, 6_000)
 
     def start(self) -> None:
         """初始化数据库、桥、只读服务与热键，失败时回滚已启动资源。"""
@@ -680,7 +812,7 @@ class DesktopRuntime(QObject):
         self.tray_icon.show()
         self.tray_icon.showMessage(
             "采集助手已启动",
-            f"按 {HOTKEY} 冻结画面并框选内容。",
+            f"按 {HOTKEY} 主动框选，或从托盘开始半自动观察。",
             QSystemTrayIcon.MessageIcon.Information,
             6_000,
         )
@@ -689,31 +821,61 @@ class DesktopRuntime(QObject):
 
     @Slot()
     def request_quit(self) -> None:
+        inbox_window = self._inbox_window
+        if inbox_window is not None and inbox_window.busy:
+            self._notify(
+                "候选仍在审核",
+                "请先在审核窗口保存或丢弃当前候选，再退出程序。",
+                warning=True,
+            )
+            return
+        if self.observation.busy:
+            if self.observation.active:
+                self.observation.request_stop()
+            self._notify(
+                "观察仍在收尾",
+                "已停止继续观察；请等待当前本地检查或证据抓取结束后再退出程序。",
+                warning=True,
+            )
+            return
         if self.coordinator.busy:
-            self.tray_icon.showMessage(
+            self._notify(
                 "暂不能退出",
                 "请先完成当前识别或在审核窗口保存/丢弃卡片。",
-                QSystemTrayIcon.MessageIcon.Warning,
-                5_000,
+                warning=True,
             )
             return
         library = self._library_window
         if library is not None and library.busy:
-            self.tray_icon.showMessage(
+            self._notify(
                 "观点库仍在处理",
                 "请等待当前保存、删除或导出结束后再退出。",
-                QSystemTrayIcon.MessageIcon.Warning,
-                5_000,
+                warning=True,
             )
             return
+        if len(self.inbox) > 0:
+            answer = QMessageBox.question(
+                None,
+                "仍有未审核候选",
+                "退出会从内存丢弃所有未审核候选，已保存卡片不受影响。确定退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         if library is not None and not library.close():
             return
+        if self.observation.active:
+            self.observation.request_stop()
+        if len(self.inbox) > 0:
+            self.inbox.discard_all()
+            self._refresh_inbox()
         self.application.quit()
 
     @Slot(QSystemTrayIcon.ActivationReason)
     def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.coordinator.request_capture()
+            self._request_capture()
 
     @Slot()
     def _show_library(self) -> None:
@@ -768,11 +930,14 @@ class DesktopRuntime(QObject):
 
     @Slot()
     def shutdown(self) -> None:
-        """按安全顺序停止采集、观点库、只读服务、快捷键和浏览器桥。"""
+        """按安全顺序停止观察、采集、内存候选与所有本机服务。"""
 
         if self._stopped:
             return
         self._stopped = True
+        observation_stopped = self.observation.shutdown()
+        if not observation_stopped:
+            LOGGER.warning("退出前未能在限定时间内结束观察工作线程")
         workers_stopped = self.coordinator.shutdown()
         if not workers_stopped:
             LOGGER.warning(
@@ -786,6 +951,13 @@ class DesktopRuntime(QObject):
             else:
                 library.hide()
                 self._library_window = None
+        inbox_window = self._inbox_window
+        if inbox_window is not None:
+            if inbox_window.shutdown():
+                self._inbox_window = None
+            else:
+                LOGGER.warning("退出前未能安全结束候选审核窗口")
+        self.inbox.close()
 
         if self.hotkey.is_started:
             try:

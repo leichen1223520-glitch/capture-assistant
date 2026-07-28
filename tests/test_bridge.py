@@ -18,9 +18,29 @@ def _bridge_uri(bridge: BrowserBridge) -> str:
 
 
 async def _hello(websocket: object) -> None:
-    await websocket.send('{"type":"hello","protocol":2}')
+    await websocket.send('{"type":"hello","protocol":3}')
     acknowledgement = json.loads(await websocket.recv())
-    assert acknowledgement == {"type": "hello_ack", "protocol": 2}
+    assert acknowledgement == {"type": "hello_ack", "protocol": 3}
+
+
+def _context_message(request_id: str, **overrides: object) -> dict[str, object]:
+    """构造字段完整的 v3 context 消息，单项测试只覆盖关心的值。"""
+
+    message: dict[str, object] = {
+        "type": "context",
+        "request_id": request_id,
+        "url": "https://example.test/",
+        "title": "示例页面",
+        "selection": "",
+        "video_time": None,
+        "sensitive_input": False,
+        "tab_id": 7,
+        "observation_text": "",
+        "observation_kind": "none",
+        "video_key": "",
+    }
+    message.update(overrides)
+    return message
 
 
 @pytest.fixture
@@ -48,10 +68,10 @@ def test_no_connection_returns_none_without_waiting_for_timeout(
     assert elapsed < 0.15
 
 
-def test_protocol_v1_hello_is_rejected(bridge: BrowserBridge) -> None:
+def test_protocol_v2_hello_is_rejected(bridge: BrowserBridge) -> None:
     async def scenario() -> int | None:
         async with connect(_bridge_uri(bridge), proxy=None) as websocket:
-            await websocket.send('{"type":"hello","protocol":1}')
+            await websocket.send('{"type":"hello","protocol":2}')
             with pytest.raises(ConnectionClosed) as caught:
                 await websocket.recv()
             return caught.value.rcvd.code if caught.value.rcvd is not None else None
@@ -81,6 +101,10 @@ def test_real_websocket_round_trip_returns_validated_context(
                         "selection": "保留原始观点",
                         "video_time": 12.5,
                         "sensitive_input": False,
+                        "tab_id": 7,
+                        "observation_text": "保留原始观点",
+                        "observation_kind": "selection",
+                        "video_key": "video-1:0",
                     },
                     ensure_ascii=False,
                 )
@@ -93,6 +117,10 @@ def test_real_websocket_round_trip_returns_validated_context(
         selection="保留原始观点",
         video_time=12.5,
         sensitive_input=False,
+        tab_id=7,
+        observation_text="保留原始观点",
+        observation_kind="selection",
+        video_key="video-1:0",
     )
 
 
@@ -114,6 +142,10 @@ def test_sensitive_context_returns_no_selection(bridge: BrowserBridge) -> None:
                         "selection": "",
                         "video_time": None,
                         "sensitive_input": True,
+                        "tab_id": 7,
+                        "observation_text": "",
+                        "observation_kind": "none",
+                        "video_key": "",
                     },
                     ensure_ascii=False,
                 )
@@ -126,6 +158,7 @@ def test_sensitive_context_returns_no_selection(bridge: BrowserBridge) -> None:
         selection="",
         video_time=None,
         sensitive_input=True,
+        tab_id=7,
     )
 
 
@@ -160,7 +193,107 @@ def test_invalid_sensitive_context_is_rejected(
                         "selection": selection,
                         "video_time": None,
                         "sensitive_input": sensitive_input,
+                        "tab_id": 7,
+                        "observation_text": "",
+                        "observation_kind": "none",
+                        "video_key": "",
                     },
+                    ensure_ascii=False,
+                )
+            )
+            with pytest.raises(ConnectionClosed) as caught:
+                await websocket.recv()
+            close_code = (
+                caught.value.rcvd.code if caught.value.rcvd is not None else None
+            )
+            return close_code, await request_task
+
+    close_code, result = asyncio.run(scenario())
+    assert close_code == 1008
+    assert result is None
+    assert bridge.is_running
+
+
+def test_caption_context_accepts_optional_tab_id_and_bounded_video_identity(
+    bridge: BrowserBridge,
+) -> None:
+    async def scenario() -> BrowserContext | None:
+        async with connect(_bridge_uri(bridge), proxy=None) as websocket:
+            await _hello(websocket)
+            request_task = asyncio.create_task(
+                asyncio.to_thread(bridge.get_browser_context, 0.5)
+            )
+            request = json.loads(await websocket.recv())
+            await websocket.send(
+                json.dumps(
+                    _context_message(
+                        str(request["request_id"]),
+                        url="https://example.test/video",
+                        title="字幕视频",
+                        video_time=8.25,
+                        tab_id=None,
+                        observation_text="这是一条原生字幕",
+                        observation_kind="caption",
+                        video_key="video-2:3",
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            return await request_task
+
+    assert asyncio.run(scenario()) == BrowserContext(
+        url="https://example.test/video",
+        title="字幕视频",
+        selection="",
+        video_time=8.25,
+        sensitive_input=False,
+        tab_id=None,
+        observation_text="这是一条原生字幕",
+        observation_kind="caption",
+        video_key="video-2:3",
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"tab_id": True},
+        {"tab_id": -1},
+        {"tab_id": 2_147_483_648},
+        {"observation_text": 1},
+        {"observation_text": "候选", "observation_kind": "none"},
+        {"observation_text": "", "observation_kind": "selection"},
+        {"observation_text": "   ", "observation_kind": "caption"},
+        {"observation_text": "候选", "observation_kind": "unknown"},
+        {
+            "observation_text": "候" * 16_385,
+            "observation_kind": "caption",
+        },
+        {"video_key": None},
+        {"video_key": "document-1:video-2"},
+        {"video_key": "v" * 129},
+        {
+            "sensitive_input": True,
+            "observation_text": "不得传递的敏感候选",
+            "observation_kind": "selection",
+        },
+        {"unexpected": True},
+    ],
+)
+def test_invalid_observation_context_is_rejected(
+    bridge: BrowserBridge,
+    overrides: dict[str, object],
+) -> None:
+    async def scenario() -> tuple[int | None, BrowserContext | None]:
+        async with connect(_bridge_uri(bridge), proxy=None) as websocket:
+            await _hello(websocket)
+            request_task = asyncio.create_task(
+                asyncio.to_thread(bridge.get_browser_context, 0.5)
+            )
+            request = json.loads(await websocket.recv())
+            await websocket.send(
+                json.dumps(
+                    _context_message(str(request["request_id"]), **overrides),
                     ensure_ascii=False,
                 )
             )
@@ -199,6 +332,10 @@ def test_timeout_and_stale_request_id_do_not_poison_next_request(
                         "selection": "不应返回",
                         "video_time": None,
                         "sensitive_input": False,
+                        "tab_id": 7,
+                        "observation_text": "",
+                        "observation_kind": "none",
+                        "video_key": "",
                     },
                     ensure_ascii=False,
                 )
@@ -218,6 +355,10 @@ def test_timeout_and_stale_request_id_do_not_poison_next_request(
                         "selection": "有效",
                         "video_time": 0,
                         "sensitive_input": False,
+                        "tab_id": 7,
+                        "observation_text": "",
+                        "observation_kind": "none",
+                        "video_key": "",
                     },
                     ensure_ascii=False,
                 )
@@ -313,6 +454,10 @@ def test_web_page_origin_is_rejected_without_replacing_extension(
                         "selection": "可信连接仍在",
                         "video_time": None,
                         "sensitive_input": False,
+                        "tab_id": 7,
+                        "observation_text": "",
+                        "observation_kind": "none",
+                        "video_key": "",
                     },
                     ensure_ascii=False,
                 )
@@ -357,6 +502,10 @@ def test_non_ascii_context_within_utf8_budget_round_trips(
                         "selection": selection,
                         "video_time": None,
                         "sensitive_input": False,
+                        "tab_id": 7,
+                        "observation_text": "",
+                        "observation_kind": "none",
+                        "video_key": "",
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -406,6 +555,10 @@ def test_concurrent_requests_can_resolve_out_of_order(
                             "selection": str(index),
                             "video_time": None,
                             "sensitive_input": False,
+                            "tab_id": 7,
+                            "observation_text": "",
+                            "observation_kind": "none",
+                            "video_key": "",
                         },
                         ensure_ascii=False,
                     )

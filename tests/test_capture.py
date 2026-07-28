@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 import tempfile
+import types
 import unittest
 from ctypes import wintypes
 from pathlib import Path
@@ -18,6 +20,7 @@ from app.capture import (
     foreground_app_name,
     foreground_window_intersects_capture,
     foreground_window_snapshot,
+    grab_monitor,
     monitor_index_for_point,
     save_image,
 )
@@ -231,6 +234,160 @@ class CaptureTests(unittest.TestCase):
         )
         self.assertFalse(foreground_window_intersects_capture(None, meta))
 
+    def test_grab_monitor_reuses_fixed_geometry_and_refreshes_runtime_metadata(self) -> None:
+        meta = CaptureMeta(
+            monitor_index=1,
+            left=0,
+            top=0,
+            width=20,
+            height=12,
+            scale=1.25,
+            device_name=r"\\.\DISPLAY1",
+            app_name="chrome.exe",
+            captured_at="2026-07-27T10:00:00+08:00",
+        )
+        rgb = bytes([12, 34, 56]) * (20 * 12)
+
+        class FakeShot:
+            size = (20, 12)
+
+            def __init__(self) -> None:
+                self.rgb = rgb
+
+        class FakeCapture:
+            monitors = [
+                {"left": 0, "top": 0, "width": 20, "height": 12},
+                {"left": 0, "top": 0, "width": 20, "height": 12},
+            ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def grab(self, monitor: object) -> FakeShot:
+                self.grabbed = monitor
+                return FakeShot()
+
+        mss_module = types.ModuleType("mss")
+        mss_module.mss = FakeCapture  # type: ignore[attr-defined]
+        exception_module = types.ModuleType("mss.exception")
+        exception_module.ScreenShotError = OSError  # type: ignore[attr-defined]
+        with (
+            patch.dict(
+                sys.modules,
+                {"mss": mss_module, "mss.exception": exception_module},
+            ),
+            patch("app.capture._require_windows"),
+            patch("app.capture.enable_per_monitor_dpi_awareness"),
+            patch(
+                "app.capture._monitor_device_name",
+                return_value=r"\\.\DISPLAY1",
+            ),
+            patch("app.capture.foreground_app_name", return_value="chrome.exe"),
+        ):
+            image, refreshed = grab_monitor(meta)
+
+        try:
+            self.assertEqual(image.size, (20, 12))
+            self.assertEqual(image.getpixel((0, 0)), (12, 34, 56))
+            self.assertEqual(refreshed.monitor_index, 1)
+            self.assertEqual(refreshed.scale, 1.25)
+            self.assertEqual(refreshed.app_name, "chrome.exe")
+            self.assertNotEqual(refreshed.captured_at, meta.captured_at)
+        finally:
+            image.close()
+
+    def test_grab_monitor_rejects_changed_display_layout_before_capture(self) -> None:
+        meta = CaptureMeta(
+            monitor_index=1,
+            left=0,
+            top=0,
+            width=20,
+            height=12,
+            scale=1.0,
+            device_name=None,
+            app_name="chrome.exe",
+            captured_at="2026-07-27T10:00:00+08:00",
+        )
+
+        class FakeCapture:
+            monitors = [
+                {"left": 0, "top": 0, "width": 30, "height": 12},
+                {"left": 0, "top": 0, "width": 30, "height": 12},
+            ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def grab(self, monitor: object) -> object:
+                raise AssertionError("布局变化后不应抓屏")
+
+        mss_module = types.ModuleType("mss")
+        mss_module.mss = FakeCapture  # type: ignore[attr-defined]
+        exception_module = types.ModuleType("mss.exception")
+        exception_module.ScreenShotError = OSError  # type: ignore[attr-defined]
+        with (
+            patch.dict(
+                sys.modules,
+                {"mss": mss_module, "mss.exception": exception_module},
+            ),
+            patch("app.capture._require_windows"),
+            patch("app.capture.enable_per_monitor_dpi_awareness"),
+        ):
+            with self.assertRaisesRegex(CaptureError, "布局或分辨率"):
+                grab_monitor(meta)
+
+    def test_grab_monitor_rejects_replaced_display_with_same_geometry(self) -> None:
+        meta = CaptureMeta(
+            monitor_index=1,
+            left=0,
+            top=0,
+            width=20,
+            height=12,
+            scale=1.0,
+            device_name=r"\\.\DISPLAY1",
+            app_name="chrome.exe",
+            captured_at="2026-07-27T10:00:00+08:00",
+        )
+
+        class FakeCapture:
+            monitors = [
+                {"left": 0, "top": 0, "width": 20, "height": 12},
+                {"left": 0, "top": 0, "width": 20, "height": 12},
+            ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def grab(self, monitor: object) -> object:
+                raise AssertionError("显示器身份变化后不应抓屏")
+
+        mss_module = types.ModuleType("mss")
+        mss_module.mss = FakeCapture  # type: ignore[attr-defined]
+        exception_module = types.ModuleType("mss.exception")
+        exception_module.ScreenShotError = OSError  # type: ignore[attr-defined]
+        with (
+            patch.dict(
+                sys.modules,
+                {"mss": mss_module, "mss.exception": exception_module},
+            ),
+            patch("app.capture._require_windows"),
+            patch("app.capture.enable_per_monitor_dpi_awareness"),
+            patch(
+                "app.capture._monitor_device_name",
+                return_value=r"\\.\DISPLAY9",
+            ),
+        ):
+            with self.assertRaisesRegex(CaptureError, "设备身份"):
+                grab_monitor(meta)
 
 if __name__ == "__main__":
     unittest.main()

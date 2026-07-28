@@ -14,7 +14,7 @@ import json
 import math
 import re
 import threading
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from websockets.asyncio.server import Server, ServerConnection, serve
@@ -24,14 +24,18 @@ from app.config import WS_PORT
 
 
 LOOPBACK_HOST = "127.0.0.1"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 64 * 1024
 
 _HELLO_TIMEOUT_SECONDS = 3.0
 _MAX_URL_LENGTH = 8_192
 _MAX_TITLE_LENGTH = 2_048
 _MAX_SELECTION_LENGTH = 32_768
+_MAX_OBSERVATION_TEXT_LENGTH = 16_384
+_MAX_VIDEO_KEY_LENGTH = 128
+_MAX_TAB_ID = 2_147_483_647
 _EXTENSION_ORIGIN = re.compile(r"chrome-extension://[a-p]{32}")
+_VIDEO_KEY = re.compile(r"video-[1-9][0-9]*:[0-9]+")
 _CONTEXT_ERROR_CODES = frozenset(
     {
         "no_active_tab",
@@ -51,6 +55,10 @@ class BrowserContext:
     selection: str
     video_time: float | None
     sensitive_input: bool = False
+    tab_id: int | None = None
+    observation_text: str = ""
+    observation_kind: Literal["none", "selection", "caption"] = "none"
+    video_key: str = ""
 
 
 class BrowserBridgeError(RuntimeError):
@@ -133,6 +141,10 @@ def _validate_context(message: dict[str, Any]) -> tuple[str, BrowserContext]:
             "request_id",
             "url",
             "title",
+            "tab_id",
+            "observation_text",
+            "observation_kind",
+            "video_key",
             "selection",
             "video_time",
             "sensitive_input",
@@ -149,11 +161,41 @@ def _validate_context(message: dict[str, Any]) -> tuple[str, BrowserContext]:
     selection = _require_bounded_string(
         message["selection"], maximum=_MAX_SELECTION_LENGTH, field="selection"
     )
+    observation_text = _require_bounded_string(
+        message["observation_text"],
+        maximum=_MAX_OBSERVATION_TEXT_LENGTH,
+        field="observation_text",
+    )
+    video_key = _require_bounded_string(
+        message["video_key"],
+        maximum=_MAX_VIDEO_KEY_LENGTH,
+        field="video_key",
+    )
+    if video_key and _VIDEO_KEY.fullmatch(video_key) is None:
+        raise _ProtocolError("video_key 格式无效")
+    observation_kind = message["observation_kind"]
+    if observation_kind not in ("none", "selection", "caption"):
+        raise _ProtocolError("observation_kind 不在允许列表中")
+    if observation_kind == "none" and observation_text:
+        raise _ProtocolError("observation_kind 为 none 时 observation_text 必须为空")
+    if observation_kind != "none" and not observation_text.strip():
+        raise _ProtocolError("观察候选必须包含非空 observation_text")
+
+    tab_id = message["tab_id"]
+    if tab_id is not None and (
+        type(tab_id) is not int or not 0 <= tab_id <= _MAX_TAB_ID
+    ):
+        raise _ProtocolError("tab_id 必须是有界非负整数或 null")
+
     sensitive_input = message["sensitive_input"]
     if type(sensitive_input) is not bool:
         raise _ProtocolError("sensitive_input 必须是布尔值")
-    if sensitive_input and selection:
-        raise _ProtocolError("敏感输入聚焦时 selection 必须为空")
+    if sensitive_input and (
+        selection or observation_text or observation_kind != "none"
+    ):
+        raise _ProtocolError(
+            "敏感输入聚焦时 selection 和观察候选必须为空"
+        )
 
     raw_video_time = message["video_time"]
     if raw_video_time is None:
@@ -172,6 +214,10 @@ def _validate_context(message: dict[str, Any]) -> tuple[str, BrowserContext]:
         title=title,
         selection=selection,
         video_time=video_time,
+        tab_id=tab_id,
+        observation_text=observation_text,
+        observation_kind=observation_kind,
+        video_key=video_key,
         sensitive_input=sensitive_input,
     )
 

@@ -947,6 +947,125 @@ class DesktopRuntimeTests(unittest.TestCase):
             library_factory=_FakeLibrary,
         )
 
+    def test_observation_actions_and_memory_inbox_are_wired_without_disk_write(self) -> None:
+        with patch("app.main.HotkeyManager", _FakeHotkey):
+            runtime = self._runtime()
+        card_id = str(uuid4())
+        prepared = PreparedCard(
+            card=Card(
+                id=card_id,
+                text="等待审核的原生字幕",
+                text_source="dom",
+                confidence=0.99,
+                screenshot_path=f"screenshots/{card_id}.png",
+                full_screenshot_path=f"screenshots/full_{card_id}.png",
+                stance="unknown",
+            ),
+            selected_image=Image.new("RGB", (5, 3), "white"),
+            full_image=Image.new("RGB", (20, 12), "black"),
+        )
+        try:
+            self.assertEqual(runtime.observe_start_action.text(), "开始半自动观察……")
+            self.assertFalse(runtime.observe_stop_action.isEnabled())
+            self.assertEqual(runtime.inbox_action.text(), "候选收件箱（0）")
+
+            added = runtime._offer_observation_candidate(
+                prepared,
+                session_id="session-one",
+                source_key="a" * 64,
+                region_key="1:0:0:5:3",
+                seen_at=10.0,
+            )
+
+            self.assertTrue(added)
+            self.assertEqual(len(runtime.inbox), 1)
+            self.assertEqual(runtime.inbox_action.text(), "候选收件箱（1）")
+            self.assertFalse(self.data_dir.exists())
+            runtime._observation_state_changed(True)
+            self.assertFalse(runtime.observe_start_action.isEnabled())
+            self.assertTrue(runtime.observe_stop_action.isEnabled())
+            self.assertFalse(runtime.capture_action.isEnabled())
+        finally:
+            runtime.shutdown()
+        self.assertTrue(prepared.is_closed)
+
+    def test_request_quit_is_blocked_while_inbox_review_owns_candidate(self) -> None:
+        class BusyInboxWindow:
+            busy = True
+
+            def shutdown(self) -> bool:
+                return True
+
+        with patch("app.main.HotkeyManager", _FakeHotkey):
+            runtime = self._runtime()
+        runtime._inbox_window = BusyInboxWindow()  # type: ignore[assignment]
+
+        try:
+            with patch("app.main.QApplication.quit") as quit_application:
+                runtime.request_quit()
+
+            quit_application.assert_not_called()
+            self.assertEqual(runtime.tray_icon.toolTip(), "本地屏幕内容与观点采集助手")
+            self.assertEqual(runtime._stopped, False)
+        finally:
+            runtime.shutdown()
+
+    def test_candidate_remains_owned_if_ui_refresh_fails_after_offer(self) -> None:
+        with patch("app.main.HotkeyManager", _FakeHotkey):
+            runtime = self._runtime()
+        card_id = str(uuid4())
+        prepared = PreparedCard(
+            card=Card(
+                id=card_id,
+                text="移交后界面刷新失败也必须保留",
+                text_source="dom",
+                confidence=0.99,
+                screenshot_path=f"screenshots/{card_id}.png",
+                full_screenshot_path=f"screenshots/full_{card_id}.png",
+                stance="unknown",
+            ),
+            selected_image=Image.new("RGB", (5, 3), "white"),
+            full_image=Image.new("RGB", (20, 12), "black"),
+        )
+        try:
+            with (
+                patch.object(
+                    runtime,
+                    "_refresh_inbox",
+                    side_effect=RuntimeError("测试界面刷新失败"),
+                ),
+                self.assertLogs("app.main", level="ERROR"),
+            ):
+                added = runtime._offer_observation_candidate(
+                    prepared,
+                    session_id="session-one",
+                    source_key="c" * 64,
+                    region_key="1:0:0:5:3",
+                    seen_at=10.0,
+                )
+
+            self.assertTrue(added)
+            self.assertEqual(len(runtime.inbox), 1)
+            self.assertFalse(prepared.is_closed)
+            self.assertEqual(runtime.inbox.snapshot()[0].card_id, card_id)
+        finally:
+            runtime.shutdown()
+        self.assertTrue(prepared.is_closed)
+
+    def test_request_quit_waits_for_observation_worker_to_finish(self) -> None:
+        with patch("app.main.HotkeyManager", _FakeHotkey):
+            runtime = self._runtime()
+        runtime.observation._worker = object()  # type: ignore[assignment]
+
+        try:
+            with patch("app.main.QApplication.quit") as quit_application:
+                runtime.request_quit()
+
+            quit_application.assert_not_called()
+            self.assertFalse(runtime._stopped)
+        finally:
+            runtime.shutdown()
+
     def test_start_and_shutdown_own_bridge_hotkey_tray_and_database(self) -> None:
         with patch("app.main.HotkeyManager", _FakeHotkey):
             runtime = self._runtime()

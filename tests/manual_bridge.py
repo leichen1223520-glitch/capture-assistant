@@ -15,7 +15,7 @@ def main() -> int:
     bridge = BrowserBridge()
     bridge.start()
     print("桥已启动：ws://127.0.0.1:8765")
-    print("协议已升级到 v2；旧扩展不兼容，请先在 chrome://extensions 重新加载扩展。")
+    print("协议已升级到 v3 / 扩展 0.3.0；旧扩展不兼容，请先在 chrome://extensions 重新加载扩展。")
     print("请在普通 http/https 页面准备好测试内容。")
     try:
         while True:
