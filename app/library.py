@@ -892,13 +892,13 @@ class LibraryWindow(QMainWindow):
         if "\x00" in str(target):
             raise RuntimeError("导出文件名无效。")
         candidate = target.expanduser()
-        if candidate.is_symlink():
-            raise RuntimeError("不能把导出文件写入符号链接。")
         if (
             str(candidate).startswith("\\\\")
             or candidate.drive.startswith("\\\\")
         ):
             raise RuntimeError("请把导出文件保存到本机磁盘，而不是网络路径。")
+        if candidate.is_symlink():
+            raise RuntimeError("不能把导出文件写入符号链接。")
         try:
             raw_resolved = candidate.resolve()
             raw_database = self.store.db_path.resolve()

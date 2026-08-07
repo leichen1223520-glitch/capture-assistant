@@ -275,6 +275,99 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(saved, card)
         self.assertEqual(loaded, card)
 
+    def test_saved_change_subscription_covers_successful_saved_mutations(self) -> None:
+        notifications: list[str] = []
+        self.store.subscribe_saved_changes(lambda: notifications.append("changed"))
+        saved = _card("正式卡片变化", suffix="saved-change")
+        draft = _card("待完成草稿", suffix="draft-finalize")
+
+        self.store.add_card(saved)
+        self.store.update_card(saved.id, note="已经更新")
+        self.store.add_draft(draft)
+        self.store.finalize_draft(draft.id, stance="useful")
+        self.assertTrue(self.store.delete_card(saved.id))
+
+        self.assertEqual(notifications, ["changed"] * 4)
+
+    def test_draft_only_operations_do_not_emit_saved_change(self) -> None:
+        notifications: list[str] = []
+        self.store.subscribe_saved_changes(lambda: notifications.append("changed"))
+        direct_delete = _card("直接删除草稿", suffix="draft-direct-delete")
+        cleanup = _card("启动清理草稿", suffix="draft-cleanup")
+        for card in (direct_delete, cleanup):
+            card.screenshot_path = f"screenshots/{card.id}.png"
+            card.full_screenshot_path = f"screenshots/full_{card.id}.png"
+            self._write_screenshots(card)
+            self.store.add_draft(card)
+
+        self.assertTrue(self.store.delete_card(direct_delete.id))
+        self.assertEqual(self.store.cleanup_drafts(), 1)
+
+        self.assertEqual(notifications, [])
+
+    def test_saved_change_unsubscribe_is_idempotent_and_safe_in_callback(self) -> None:
+        notifications: list[str] = []
+        unsubscribe_holder: dict[str, object] = {}
+
+        def callback() -> None:
+            notifications.append("changed")
+            unsubscribe = unsubscribe_holder["unsubscribe"]
+            assert callable(unsubscribe)
+            unsubscribe()
+
+        unsubscribe = self.store.subscribe_saved_changes(callback)
+        unsubscribe_holder["unsubscribe"] = unsubscribe
+
+        self.store.add_card(_card("第一次变化", suffix="unsubscribe-one"))
+        unsubscribe()
+        unsubscribe()
+        self.store.add_card(_card("第二次变化", suffix="unsubscribe-two"))
+
+        self.assertEqual(notifications, ["changed"])
+
+    def test_saved_change_callback_failure_isolated_from_commit_and_peers(self) -> None:
+        peer_notifications: list[str] = []
+
+        def failing_callback() -> None:
+            raise RuntimeError("订阅者自身故障")
+
+        self.store.subscribe_saved_changes(failing_callback)
+        self.store.subscribe_saved_changes(
+            lambda: peer_notifications.append("changed")
+        )
+        card = _card("回调失败不能回滚", suffix="callback-failure")
+
+        with self.assertLogs("app.store", level="ERROR") as captured:
+            returned = self.store.add_card(card)
+
+        self.assertEqual(returned, card)
+        self.assertEqual(self.store.get_card(card.id), card)
+        self.assertEqual(peer_notifications, ["changed"])
+        self.assertTrue(
+            any("已保存卡片变更订阅回调执行失败" in line for line in captured.output)
+        )
+
+    def test_failed_database_write_does_not_emit_saved_change(self) -> None:
+        card = _card("重复主键", suffix="failed-write")
+        self.store.add_card(card)
+        notifications: list[str] = []
+        self.store.subscribe_saved_changes(lambda: notifications.append("changed"))
+
+        with self.assertRaises(StoreError):
+            self.store.add_card(card)
+
+        self.assertEqual(notifications, [])
+
+    def test_noop_update_does_not_emit_saved_change(self) -> None:
+        card = _card("没有发生变化", suffix="noop-update")
+        self.store.add_card(card)
+        notifications: list[str] = []
+        self.store.subscribe_saved_changes(lambda: notifications.append("changed"))
+
+        self.assertEqual(self.store.update_card(card.id), card)
+
+        self.assertEqual(notifications, [])
+
     def test_round_trip_preserves_separate_edited_text(self) -> None:
         base = _card("OCR 最初提取的文字", suffix="edited")
         card = Card(

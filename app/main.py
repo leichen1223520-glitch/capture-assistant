@@ -14,6 +14,7 @@ from PySide6.QtCore import QObject, QRect, QRunnable, QThreadPool, QUrl, Signal,
 from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QMenu,
     QMessageBox,
     QStyle,
@@ -43,6 +44,8 @@ from .inbox import CandidateInbox
 from .inbox_window import CandidateInboxWindow
 from .library import LibraryWindow
 from .models import Card
+from .obsidian import ObsidianError, SyncResult
+from .obsidian_sync import ObsidianArchiveManager
 from .observation import ObservationCoordinator
 from .ocr import OCRError
 from .overlay import OverlayError, select_region
@@ -601,6 +604,9 @@ class DesktopRuntime(QObject):
         bridge_stop: Callable[..., None] = stop_browser_bridge,
         api_server_factory: Callable[[Store], _ApiServerLike] = LocalApiServer,
         library_factory: Callable[..., LibraryWindow] = LibraryWindow,
+        obsidian_manager_factory: Callable[..., ObsidianArchiveManager] = (
+            ObsidianArchiveManager
+        ),
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -616,6 +622,13 @@ class DesktopRuntime(QObject):
         self.api_server: _ApiServerLike | None = None
         self._library_window: LibraryWindow | None = None
         self._inbox_window: CandidateInboxWindow | None = None
+        self.obsidian = obsidian_manager_factory(
+            self.store,
+            data_dir=self.data_dir,
+            parent=self,
+        )
+        self._updating_obsidian_actions = False
+        self._last_obsidian_notice: tuple[str, ...] | None = None
         self.hotkey = HotkeyManager(HOTKEY, parent=self)
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setToolTip("本地屏幕内容与观点采集助手")
@@ -631,6 +644,24 @@ class DesktopRuntime(QObject):
         self.search_action = QAction("打开观点库", self.menu)
         self.quit_action = QAction("退出", self.menu)
         self.readonly_search_action = QAction("打开只读检索网页", self.menu)
+        self.obsidian_menu = QMenu("Obsidian 自动归档", self.menu)
+        self.obsidian_status_action = QAction("状态：尚未选择 Vault", self.obsidian_menu)
+        self.obsidian_status_action.setEnabled(False)
+        self.obsidian_choose_action = QAction("选择 Vault……", self.obsidian_menu)
+        self.obsidian_enabled_action = QAction("启用自动归档", self.obsidian_menu)
+        self.obsidian_enabled_action.setCheckable(True)
+        self.obsidian_copy_action = QAction("复制选区证据截图", self.obsidian_menu)
+        self.obsidian_copy_action.setCheckable(True)
+        self.obsidian_sync_action = QAction("立即同步", self.obsidian_menu)
+        self.obsidian_open_action = QAction("打开归档目录", self.obsidian_menu)
+        self.obsidian_menu.addAction(self.obsidian_status_action)
+        self.obsidian_menu.addSeparator()
+        self.obsidian_menu.addAction(self.obsidian_choose_action)
+        self.obsidian_menu.addAction(self.obsidian_enabled_action)
+        self.obsidian_menu.addAction(self.obsidian_copy_action)
+        self.obsidian_menu.addSeparator()
+        self.obsidian_menu.addAction(self.obsidian_sync_action)
+        self.obsidian_menu.addAction(self.obsidian_open_action)
         self.menu.addAction(self.observe_start_action)
         self.menu.addAction(self.observe_stop_action)
         self.menu.addAction(self.inbox_action)
@@ -638,6 +669,7 @@ class DesktopRuntime(QObject):
         self.menu.addAction(self.capture_action)
         self.menu.addAction(self.search_action)
         self.menu.addAction(self.readonly_search_action)
+        self.menu.addMenu(self.obsidian_menu)
         self.menu.addSeparator()
         self.menu.addAction(self.quit_action)
         self.tray_icon.setContextMenu(self.menu)
@@ -665,11 +697,20 @@ class DesktopRuntime(QObject):
         self.inbox_action.triggered.connect(self._show_inbox)
         self.search_action.triggered.connect(self._show_library)
         self.readonly_search_action.triggered.connect(self._open_readonly_search)
+        self.obsidian_choose_action.triggered.connect(self._choose_obsidian_vault)
+        self.obsidian_enabled_action.toggled.connect(self._toggle_obsidian_enabled)
+        self.obsidian_copy_action.toggled.connect(self._toggle_obsidian_attachments)
+        self.obsidian_sync_action.triggered.connect(self._sync_obsidian_now)
+        self.obsidian_open_action.triggered.connect(self._open_obsidian_folder)
+        self.obsidian.state_changed.connect(self._refresh_obsidian_actions)
+        self.obsidian.sync_completed.connect(self._obsidian_sync_completed)
+        self.obsidian.sync_failed.connect(self._obsidian_sync_failed)
         self.quit_action.triggered.connect(self.request_quit)
         self.tray_icon.activated.connect(self._tray_activated)
         self.application.aboutToQuit.connect(self.shutdown)
         self._started = False
         self._stopped = False
+        self._refresh_obsidian_actions()
 
     @Slot()
     def _request_capture(self) -> None:
@@ -778,6 +819,201 @@ class DesktopRuntime(QObject):
         )
         self.tray_icon.showMessage(title, message, icon, 6_000)
 
+    @Slot()
+    def _refresh_obsidian_actions(self) -> None:
+        """让托盘开关只反映已经成功写入 D 盘的集成配置。"""
+
+        settings = self.obsidian.settings
+        if self.obsidian.configuration_error is not None:
+            status = "状态：配置需要修复"
+        elif not settings.vault_path:
+            status = "状态：尚未选择 Vault"
+        elif not settings.enabled:
+            status = "状态：已暂停"
+        elif self.obsidian.busy:
+            status = "状态：正在同步"
+        elif self.obsidian.last_sync_issue is not None:
+            status = "状态：有同步问题"
+        else:
+            status = "状态：自动归档已开启"
+
+        self._updating_obsidian_actions = True
+        try:
+            self.obsidian_status_action.setText(status)
+            self.obsidian_enabled_action.setChecked(settings.enabled)
+            self.obsidian_copy_action.setChecked(settings.copy_attachments)
+            configured = bool(settings.vault_path)
+            self.obsidian_choose_action.setEnabled(not self.obsidian.busy)
+            self.obsidian_enabled_action.setEnabled(not self.obsidian.busy)
+            self.obsidian_copy_action.setEnabled(
+                configured and not self.obsidian.busy
+            )
+            self.obsidian_sync_action.setEnabled(configured and settings.enabled)
+            managed_root = self.obsidian.managed_root
+            self.obsidian_open_action.setEnabled(
+                managed_root is not None and managed_root.is_dir()
+            )
+        finally:
+            self._updating_obsidian_actions = False
+
+    @Slot()
+    def _choose_obsidian_vault(self) -> bool:
+        """让用户明确选择并确认一个已有 Vault，随后开启单向归档。"""
+
+        selected = QFileDialog.getExistingDirectory(
+            None,
+            "选择 Obsidian Vault（需包含 .obsidian 文件夹）",
+            self.obsidian.settings.vault_path or str(self.data_dir.parent),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not selected:
+            self._refresh_obsidian_actions()
+            return False
+        answer = QMessageBox.question(
+            None,
+            "启用 Obsidian 单向归档",
+            (
+                "程序只会把已经人工审核并保存的卡片写入所选 Vault 的 "
+                "“Capture Assistant”受管目录；未审核候选不会写入。\n\n"
+                "SQLite 仍是主资料库，Obsidian 修改不会反写。若该 Vault 使用 "
+                "Obsidian Sync、OneDrive 等同步，归档内容可能离开本机。\n\n"
+                "确定选择并开启自动归档吗？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._refresh_obsidian_actions()
+            return False
+        try:
+            self.obsidian.configure(selected, enabled=True)
+        except (ObsidianError, OSError, RuntimeError, ValueError) as exc:
+            LOGGER.warning("无法配置 Obsidian 归档：%s", type(exc).__name__)
+            self._notify("无法启用 Obsidian 归档", str(exc), warning=True)
+            self._refresh_obsidian_actions()
+            return False
+        self._refresh_obsidian_actions()
+        self._notify(
+            "Obsidian 自动归档已开启",
+            "正在后台整理已保存卡片；未审核候选仍只保留在内存。",
+        )
+        return True
+
+    @Slot(bool)
+    def _toggle_obsidian_enabled(self, checked: bool) -> None:
+        if self._updating_obsidian_actions:
+            return
+        if checked and not self.obsidian.configured:
+            self._choose_obsidian_vault()
+            return
+        try:
+            self.obsidian.set_enabled(checked)
+        except (ObsidianError, OSError, RuntimeError, ValueError) as exc:
+            LOGGER.warning("无法切换 Obsidian 归档：%s", type(exc).__name__)
+            self._notify("无法更改 Obsidian 归档", str(exc), warning=True)
+        else:
+            if not checked:
+                self._notify(
+                    "Obsidian 自动归档已暂停",
+                    "本地资料库不受影响；已有 Obsidian 笔记不会自动删除。",
+                )
+        self._refresh_obsidian_actions()
+
+    @Slot(bool)
+    def _toggle_obsidian_attachments(self, checked: bool) -> None:
+        if self._updating_obsidian_actions:
+            return
+        if checked:
+            answer = QMessageBox.question(
+                None,
+                "复制选区证据截图",
+                (
+                    "开启后，会把每张已保存卡片的选区截图复制到 Obsidian "
+                    "受管目录。关闭此开关不会自动删除已经复制的截图。确定开启吗？"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._refresh_obsidian_actions()
+                return
+        try:
+            self.obsidian.set_copy_attachments(checked)
+        except (ObsidianError, OSError, RuntimeError, ValueError) as exc:
+            LOGGER.warning("无法更改 Obsidian 截图设置：%s", type(exc).__name__)
+            self._notify("无法更改截图归档", str(exc), warning=True)
+        else:
+            if not checked:
+                self._notify(
+                    "已停止复制新截图",
+                    "已经存在于 Obsidian 的截图副本会保留，程序不会自动删除。",
+                )
+        self._refresh_obsidian_actions()
+
+    @Slot()
+    def _sync_obsidian_now(self) -> None:
+        if not self.obsidian.request_sync(manual=True):
+            if self.obsidian.busy:
+                self._notify(
+                    "同步请求已排队",
+                    "当前归档完成后会再进行一次对账。",
+                )
+            elif not self.obsidian.settings.enabled:
+                self._notify(
+                    "Obsidian 自动归档尚未开启",
+                    "请先选择 Vault 并启用自动归档。",
+                    warning=True,
+                )
+
+    @Slot(object, bool)
+    def _obsidian_sync_completed(self, result: object, manual: bool) -> None:
+        self._refresh_obsidian_actions()
+        if not isinstance(result, SyncResult):
+            return
+        if result.conflicts:
+            notice_key = tuple(result.conflicts)
+            if manual or notice_key != self._last_obsidian_notice:
+                self._notify(
+                    "Obsidian 中有内容需要处理",
+                    (
+                        f"有 {len(result.conflicts)} 个受管文件存在冲突，程序没有覆盖它们。"
+                        "请保留用户补充后再手动同步。"
+                    ),
+                    warning=True,
+                )
+            self._last_obsidian_notice = notice_key
+            return
+        self._last_obsidian_notice = None
+        if manual or result.changed:
+            self._notify(
+                "Obsidian 归档已完成",
+                (
+                    f"新建 {result.created_notes} 张，更新 {result.updated_notes} 张，"
+                    f"复制 {result.copied_attachments} 个选区截图。"
+                ),
+            )
+
+    @Slot(str, bool)
+    def _obsidian_sync_failed(self, message: str, manual: bool) -> None:
+        self._refresh_obsidian_actions()
+        notice_key = (message,)
+        if manual or notice_key != self._last_obsidian_notice:
+            self._notify("Obsidian 自动归档失败", message, warning=True)
+        self._last_obsidian_notice = notice_key
+
+    @Slot()
+    def _open_obsidian_folder(self) -> None:
+        root = self.obsidian.managed_root
+        if root is None or not root.is_dir():
+            self._notify(
+                "归档目录尚未生成",
+                "请先启用并完成一次 Obsidian 同步。",
+                warning=True,
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(root))):
+            self._notify("无法打开归档目录", "Windows 未能打开该本地目录。", warning=True)
+
     def start(self) -> None:
         """初始化数据库、桥、只读服务与热键，失败时回滚已启动资源。"""
 
@@ -788,13 +1024,28 @@ class DesktopRuntime(QObject):
         if removed_drafts:
             LOGGER.info("启动时清理了 %d 张未审核候选卡片", removed_drafts)
         bridge_started = False
+        hotkey_started = False
+        obsidian_started = False
         try:
             self.bridge_start()
             bridge_started = True
             self.api_server = self.api_server_factory(self.store)
             self.api_server.start()
             self.hotkey.start()
+            hotkey_started = True
+            obsidian_started = True
+            self.obsidian.start()
         except Exception:
+            if hotkey_started:
+                try:
+                    self.hotkey.stop()
+                except HotkeyError:
+                    LOGGER.exception("启动回滚时无法注销全局快捷键")
+            if obsidian_started:
+                try:
+                    self.obsidian.shutdown(1_000)
+                except (ObsidianError, RuntimeError, ValueError):
+                    LOGGER.exception("启动回滚时无法停止 Obsidian 自动归档")
             if self.api_server is not None:
                 try:
                     self.api_server.stop()
@@ -959,11 +1210,19 @@ class DesktopRuntime(QObject):
                 LOGGER.warning("退出前未能安全结束候选审核窗口")
         self.inbox.close()
 
+        # 最后一次 Obsidian 对账可能等待磁盘；先注销热键，避免退出期间又开始捕获。
         if self.hotkey.is_started:
             try:
                 self.hotkey.stop()
             except HotkeyError:
                 LOGGER.exception("退出时无法注销全局快捷键")
+
+        if not self.obsidian.shutdown(10_000):
+            LOGGER.warning(
+                "退出前未能在限定时间内完成 Obsidian 最后一次对账；"
+                "下次启动会自动补齐"
+            )
+
         if self.api_server is not None:
             try:
                 self.api_server.stop()

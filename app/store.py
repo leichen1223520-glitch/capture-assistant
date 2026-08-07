@@ -8,15 +8,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Final
+from threading import Lock
+from typing import Any, Callable, Final
 
 from pydantic import ValidationError
 
 from .config import DATA_DIR, DB_PATH
 from .models import Card, Stance, TextSource
+
+LOGGER = logging.getLogger(__name__)
 
 FTS_TOKENIZERS: Final = ("trigram", "unicode61")
 RECORD_STATES: Final = ("draft", "saved")
@@ -50,6 +54,42 @@ class Store:
         self.db_path = Path(db_path).expanduser().resolve()
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.screenshot_dir = self.data_dir / "screenshots"
+        self._saved_change_lock = Lock()
+        self._saved_change_callbacks: dict[object, Callable[[], None]] = {}
+
+    def subscribe_saved_changes(
+        self,
+        callback: Callable[[], None],
+    ) -> Callable[[], None]:
+        """订阅本实例内正式卡片的成功写入，并返回幂等取消函数。
+
+        回调不接收卡片内容，只表示正式卡片集合可能已经改变。通知发生在数据库
+        事务提交之后；取消与通知并发时，已经取得快照的一次通知仍可能执行回调。
+        """
+
+        if not callable(callback):
+            raise TypeError("卡片变更订阅回调必须可调用。")
+        subscription = object()
+        with self._saved_change_lock:
+            self._saved_change_callbacks[subscription] = callback
+
+        def unsubscribe() -> None:
+            with self._saved_change_lock:
+                self._saved_change_callbacks.pop(subscription, None)
+
+        return unsubscribe
+
+    def _notify_saved_changes(self) -> None:
+        """在不持有订阅锁的情况下隔离执行当前回调快照。"""
+
+        with self._saved_change_lock:
+            callbacks = tuple(self._saved_change_callbacks.values())
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                # 回调只收到无参数变更信号；不要在这里附带卡片正文或来源。
+                LOGGER.exception("已保存卡片变更订阅回调执行失败。")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5.0)
@@ -335,6 +375,8 @@ class Store:
             raise StoreError("卡片 ID 已存在或字段违反数据库约束。") from exc
         except sqlite3.Error as exc:
             raise StoreError("无法保存本地卡片。") from exc
+        if record_state == "saved":
+            self._notify_saved_changes()
         return validated
 
     def add_card(self, card: Card) -> Card:
@@ -430,6 +472,7 @@ class Store:
                     raise StoreError("待更新卡片在写入前已不存在。")
         except sqlite3.Error as exc:
             raise StoreError("无法更新本地卡片。") from exc
+        self._notify_saved_changes()
         return validated
 
     def finalize_draft(self, card_id: str, **changes: Any) -> Card:
@@ -488,6 +531,7 @@ class Store:
                     raise StoreError("草稿在完成写入前已不存在或状态已经改变。")
         except sqlite3.Error as exc:
             raise StoreError("无法完成本地草稿。") from exc
+        self._notify_saved_changes()
         return validated
 
     def list_recent(self, limit: int = 50, offset: int = 0) -> list[Card]:
@@ -515,9 +559,9 @@ class Store:
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
-            or not 1 <= limit <= 10_000
+            or not 1 <= limit <= 10_001
         ):
-            raise StoreError("快照上限需为 1–10000。")
+            raise StoreError("快照上限需为 1–10001。")
         try:
             with closing(self._connect()) as connection:
                 rows = connection.execute(
@@ -739,6 +783,7 @@ class Store:
             raise StoreError("待删除卡片状态不合法。")
 
         connection = self._connect()
+        deleted_saved = False
         try:
             connection.execute("BEGIN IMMEDIATE")
             if required_state is None:
@@ -754,6 +799,7 @@ class Store:
             if row is None:
                 connection.rollback()
                 return False
+            deleted_saved = str(row["record_state"]) == "saved"
             card = self._row_to_card(row)
             paths = {
                 self._safe_screenshot_path(card.screenshot_path),
@@ -784,7 +830,6 @@ class Store:
             if cursor.rowcount != 1:
                 raise StoreError("待删除卡片在写入前已不存在。")
             connection.commit()
-            return True
         except StoreError:
             connection.rollback()
             raise
@@ -793,6 +838,9 @@ class Store:
             raise StoreError("截图已清理，但无法删除本地数据库记录。") from exc
         finally:
             connection.close()
+        if deleted_saved:
+            self._notify_saved_changes()
+        return True
 
     def delete_card(self, card_id: str) -> bool:
         """删除正式卡片或草稿、FTS 记录和两张截图；不存在时返回 ``False``。"""

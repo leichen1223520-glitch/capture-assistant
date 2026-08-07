@@ -15,6 +15,7 @@ SCREENSHOT_DIR = DATA_DIR / "screenshots"
 HOTKEY = os.environ.get("CAPTURE_ASSISTANT_HOTKEY", "ctrl+shift+s")
 WS_PORT = int(os.environ.get("CAPTURE_ASSISTANT_WS_PORT", "8765"))
 API_PORT = int(os.environ.get("CAPTURE_ASSISTANT_API_PORT", "8000"))
+OBSIDIAN_RECONCILE_INTERVAL_MS = 30_000
 
 
 def ensure_data_dirs(

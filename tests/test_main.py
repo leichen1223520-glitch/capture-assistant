@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import tempfile
 import time
@@ -26,7 +27,7 @@ from PySide6.QtCore import (  # noqa: E402
     QTimer,
     Signal,
 )
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from app.bridge import BrowserContext  # noqa: E402
 from app.capture import CaptureMeta, ForegroundWindowSnapshot  # noqa: E402
@@ -1111,6 +1112,40 @@ class DesktopRuntimeTests(unittest.TestCase):
             runtime.shutdown()
 
         self.assertTrue(library.hidden)
+
+    def test_tray_configures_obsidian_vault_and_creates_local_managed_index(self) -> None:
+        vault = Path(self.temporary.name) / "obsidian-vault"
+        (vault / ".obsidian").mkdir(parents=True)
+        with (
+            patch("app.main.HotkeyManager", _FakeHotkey),
+            patch("app.main.QFileDialog.getExistingDirectory", return_value=str(vault)),
+            patch(
+                "app.main.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+        ):
+            runtime = self._runtime()
+            runtime.start()
+            self.assertTrue(runtime._choose_obsidian_vault())
+
+            deadline = time.monotonic() + 5.0
+            while runtime.obsidian.busy and time.monotonic() < deadline:
+                self.application.processEvents()
+                time.sleep(0.01)
+            self.application.processEvents()
+
+            settings_path = self.data_dir / "integrations" / "obsidian.json"
+            self.assertTrue(settings_path.is_file())
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertTrue(settings["enabled"])
+            self.assertEqual(Path(settings["vault_path"]), vault.resolve())
+            self.assertFalse(settings["copy_attachments"])
+            self.assertTrue((vault / "Capture Assistant" / "索引.md").is_file())
+            self.assertEqual(
+                runtime.obsidian_status_action.text(),
+                "状态：自动归档已开启",
+            )
+            runtime.shutdown()
 
     def test_shutdown_keeps_library_reference_if_its_task_times_out(self) -> None:
         with patch("app.main.HotkeyManager", _FakeHotkey):

@@ -23,6 +23,7 @@ class ConfigTests(unittest.TestCase):
         self.assertLessEqual(config.WS_PORT, 65535)
         self.assertGreaterEqual(config.API_PORT, 1)
         self.assertLessEqual(config.API_PORT, 65535)
+        self.assertEqual(config.OBSIDIAN_RECONCILE_INTERVAL_MS, 30_000)
         self.assertIsInstance(config.DATA_DIR, Path)
         self.assertIsInstance(config.DB_PATH, Path)
         self.assertIsInstance(config.SCREENSHOT_DIR, Path)
